@@ -29,9 +29,10 @@ VMX_CFLAGS     = @VMX_CFLAGS@
 CPPFLAGS       = @CPPFLAGS@
 LDFLAGS        = @LDFLAGS@
 DEFS           = @DEFS@
-LIBS           = -lhmmer -leasel -ldivsufsort  @LIBS@ @LIBGSL@ @PTHREAD_LIBS@ -lm
+LIBS           = -lhmmer -leasel -ldivsufsort  @LIBS@ @LIBGSL@ @PTHREAD_LIBS@ ${PZ_LIBS} -lm
 
 AR        = @AR@
+OBJCOPY   ?= objcopy
 RANLIB    = @RANLIB@
 STRIP     = @STRIP@
 INSTALL   = @INSTALL@
@@ -39,6 +40,52 @@ INSTALL   = @INSTALL@
 IMPLDIR   = impl_@IMPL_CHOICE@
 ESLDIR    = @HMMER_ESLDIR@
 SADIR     = @HMMER_SADIR@
+
+# PEZY-SC (PZCL) offload
+#
+# Detected at build time.  Override the SDK location with PZSDK_PATH=... ,
+# the device generation with PZ_ARCH=... (only sc3 has been tested), or
+# disable the offload entirely with HMMER_NO_PEZY=1.
+#
+PZSDK_PATH ?= /opt/pezy/pzsdk
+PZ_ARCH    ?= sc3
+# Depending on the SDK version, the headers are under include/ or inc/.  Look
+# for the header itself rather than assuming a directory name: when this
+# guessed wrong, PZ_FOUND just went empty and the build silently produced a
+# CPU-only binary that still passed every correctness test.
+PZ_HDR     := $(firstword $(wildcard $(PZSDK_PATH)/include/pzcl/pzcl.h $(PZSDK_PATH)/inc/pzcl/pzcl.h))
+PZ_INCDIR  := $(patsubst %/pzcl/pzcl.h,%,$(PZ_HDR))
+PZ_FOUND   := $(shell test -x $(PZSDK_PATH)/bin/pzcc -a -r "$(PZ_HDR)" -a -r $(PZSDK_PATH)/lib/libpzcl.so && echo yes)
+ifdef HMMER_NO_PEZY
+PZ_FOUND   :=
+endif
+ifeq ($(PZ_FOUND),yes)
+PZ_CFLAGS   = -DHAVE_PEZY -I$(PZ_INCDIR)
+PZ_LIBS     = -L$(PZSDK_PATH)/lib -lpzcl -lstdc++ -Wl,-rpath,$(PZSDK_PATH)/lib
+PZ_OBJS     = p7_pz.o p7_pzdb.o p7_pzscan.o p7_pz_kernel_pz.o
+PZ_PROGS    = pz_ssv_utest pz_pzdb_utest pz_ssvmulti_utest pz_fpprobe_utest pz_fwdparse_utest pz_bwprobe_utest
+endif
+
+# Git commit the binary is built from, shown on the -h help page.
+#
+# Captured here rather than by ./configure, so that it tracks the working
+# tree at *compile* time and not at configure time.  GIT_DIRTY only looks at
+# tracked files: the build itself drops generated files into the tree, and
+# those must not make every build look modified.
+#
+# A source tree distributed without .git has no repository of its own, and
+# may well sit inside some other repository whose HEAD would be the wrong
+# answer.  Such a tree carries the commit (with -dirty already applied) in
+# ${top_srcdir}/GIT_COMMIT, and when that file is there it wins over git.
+GIT         ?= git
+GIT_STAMP   := $(wildcard ${top_srcdir}/GIT_COMMIT)
+ifneq ($(GIT_STAMP),)
+GIT_COMMIT  := $(shell head -n 1 $(GIT_STAMP))
+GIT_DIRTY   :=
+else
+GIT_COMMIT  := $(shell cd ${top_srcdir} 2>/dev/null && $(GIT) rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+GIT_DIRTY   := $(shell cd ${top_srcdir} 2>/dev/null && $(GIT) diff --quiet HEAD -- 2>/dev/null || echo -dirty)
+endif
 
 MYLIBDIRS = -L../${ESLDIR} -L./${IMPLDIR} -L../${SADIR} -L.
 MYINCDIRS = -I../${ESLDIR} \
@@ -96,14 +143,15 @@ AUXPROGOBJS = \
 	hmmc2.o \
 	hmmerfm-exactmatch.o
 
-HDRS =  hmmer.h \
+HDRS =  hmmer.h p7_fbstat.h \
 	cachedb.h \
 	p7_gbands.h \
 	p7_gmxb.h \
 	p7_gmxchk.h \
 	p7_hmmcache.h
 
-OBJS =  build.o\
+OBJS =  ${PZ_OBJS}\
+	build.o\
 	cachedb.o\
 	cachedb_shard.o\
 	emit.o\
@@ -141,6 +189,7 @@ OBJS =  build.o\
 	p7_builder.o\
 	p7_domain.o\
 	p7_domaindef.o\
+	p7_fbstat.o\
 	p7_gbands.o\
 	p7_gmx.o\
 	p7_gmxb.o\
@@ -247,7 +296,7 @@ endif
 
 all:   ${PROGS} ${AUXPROGS} .FORCE
 
-dev:   ${PROGS} ${AUXPROGS} ${UTESTS} ${ITESTS} ${STATS} ${BENCHMARKS} ${EXAMPLES} .FORCE
+dev:   ${PROGS} ${AUXPROGS} ${PZ_PROGS} ${UTESTS} ${ITESTS} ${STATS} ${BENCHMARKS} ${EXAMPLES} .FORCE
 	${QUIET_SUBDIR0}${IMPLDIR} ${QUIET_SUBDIR1} dev
 
 tests: ${PROGS} ${AUXPROGS} ${UTESTS} ${ITESTS} .FORCE
@@ -271,16 +320,51 @@ ${OBJS}:        ${HDRS} p7_config.h
 ${PROGOBJS}:    ${HDRS} p7_config.h
 ${AUXPROGOBJS}: ${HDRS} p7_config.h
 
+# p7_gitversion.h is regenerated on every make, but only *replaced* when the
+# commit id actually changes -- otherwise every build would relink the world.
+hmmer.o: p7_gitversion.h
+
+p7_gitversion.h: .FORCE
+	@echo '/* Generated at build time by src/Makefile. Do not edit, do not commit. */' >  $@.tmp
+	@echo '#define HMMER_GIT_COMMIT "${GIT_COMMIT}${GIT_DIRTY}"'                       >> $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; echo '    ' GEN $@; fi
+
+# The PEZY sources have their own headers, which are deliberately not in
+# ${HDRS} (that list is what gets installed).  p7_pz_fpprobe.h in particular
+# is shared with the *device* kernel: if only one side is rebuilt after it
+# changes, the two disagree about how many output slices there are and the
+# kernel writes past the end of its buffer -- which shows up as a corrupted
+# completion tally, not as a compile error.
+ifeq ($(PZ_FOUND),yes)
+PZ_HDRS = p7_pz.h p7_pzdb.h p7_pzscan.h p7_pz_fpprobe.h
+${PZ_OBJS}:                  ${PZ_HDRS}
+p7_pz_kernel.pz:             ${srcdir}/p7_pz_fpprobe.h
+pz_ssv_utest.o pz_pzdb_utest.o pz_ssvmulti_utest.o pz_fpprobe_utest.o: ${PZ_HDRS}
+endif
+
+${PZ_PROGS}: % : %.o libhmmer.a ../${ESLDIR}/libeasel.a
+	${QUIET_GEN}${CC} ${CFLAGS} ${PTHREAD_CFLAGS} ${PIC_CFLAGS} ${SSE_CFLAGS} ${PZ_CFLAGS} ${DEFS} ${CPPFLAGS} ${LDFLAGS} ${MYLIBDIRS} -o $@ $@.o ${LIBS}
+
 ${PROGS} ${AUXPROGS}: % : %.o  libhmmer.a ../${ESLDIR}/libeasel.a 
 	${QUIET_GEN}${CC} ${CFLAGS} ${PTHREAD_CFLAGS} ${PIC_CFLAGS} ${NEON_CFLAGS} ${SSE_CFLAGS} ${VMX_CFLAGS} ${DEFS} ${CPPFLAGS} ${LDFLAGS} ${MYLIBDIRS} -o $@ $@.o ${LIBS}
 
 .c.o:
-	${QUIET_CC}${CC} ${CFLAGS} ${PTHREAD_CFLAGS} ${PIC_CFLAGS} ${NEON_CFLAGS}  ${SSE_CFLAGS} ${VMX_CFLAGS} ${DEFS} ${CPPFLAGS} ${MYINCDIRS} -o $@ -c $<
+	${QUIET_CC}${CC} ${CFLAGS} ${PTHREAD_CFLAGS} ${PIC_CFLAGS} ${NEON_CFLAGS}  ${SSE_CFLAGS} ${VMX_CFLAGS} ${PZ_CFLAGS} ${DEFS} ${CPPFLAGS} ${MYINCDIRS} -o $@ -c $<
 
-${ITESTS}: % : %.o libhmmer.a ${HDRS} p7_config.h
+# --- PEZY device kernel -------------------------------------------------
+# pzcc compiles the kernel to a .pz device image; objcopy wraps it so the
+# host can reference it as _binary_p7_pz_kernel_pz_{start,end}.  The bare
+# filename matters: objcopy derives the symbol names from the path it is given.
+p7_pz_kernel.pz: ${srcdir}/p7_pz_kernel.pzc
+	${QUIET_GEN}$(PZSDK_PATH)/bin/pzcc --arch $(PZ_ARCH) -O3 -ffp-contract=off -I. $< -o $@
+
+p7_pz_kernel_pz.o: p7_pz_kernel.pz
+	${QUIET_GEN}${OBJCOPY} -B i386 -I binary p7_pz_kernel.pz -O elf64-x86-64 $@
+
+${ITESTS}: % : %.o libhmmer.a ${HDRS} p7_config.h p7_gitversion.h
 	${QUIET_GEN}${CC} ${CFLAGS} ${PTHREAD_CFLAGS} ${PIC_CFLAGS} ${NEON_CFLAGS} ${SSE_CFLAGS} ${VMX_CFLAGS} ${DEFS} ${CPPFLAGS} ${LDFLAGS} ${MYLIBDIRS} -o $@ $@.o ${LIBS}
 
-${UTESTS}: libhmmer.a  ${HDRS} p7_config.h
+${UTESTS}: libhmmer.a  ${HDRS} p7_config.h p7_gitversion.h
 	@BASENAME=`echo $@ | sed -e 's/_utest//' | sed -e 's/^p7_//'` ;\
 	DFLAG=`echo $${BASENAME} | sed -e 'y/abcdefghijklmnopqrstuvwxyz/ABCDEFGHIJKLMNOPQRSTUVWXYZ/'`;\
 	DFLAG=p7$${DFLAG}_TESTDRIVE ;\
@@ -295,7 +379,7 @@ ${UTESTS}: libhmmer.a  ${HDRS} p7_config.h
         fi ;\
 	${CC} ${CFLAGS} ${PTHREAD_CFLAGS} ${PIC_CFLAGS} ${NEON_CFLAGS} ${SSE_CFLAGS} ${VMX_CFLAGS} ${CPPFLAGS} ${LDFLAGS} ${DEFS} ${MYLIBDIRS} ${MYINCDIRS} -D$${DFLAG} -o $@ $${DFILE} ${LIBS}
 
-${BENCHMARKS}: libhmmer.a  ${HDRS} p7_config.h
+${BENCHMARKS}: libhmmer.a  ${HDRS} p7_config.h p7_gitversion.h
 	@BASENAME=`echo $@ | sed -e 's/_benchmark//' | sed -e 's/^p7_//'` ;\
 	DFLAG=`echo $${BASENAME} | sed -e 'y/abcdefghijklmnopqrstuvwxyz/ABCDEFGHIJKLMNOPQRSTUVWXYZ/'`;\
 	DFLAG=p7$${DFLAG}_BENCHMARK ;\
@@ -310,7 +394,7 @@ ${BENCHMARKS}: libhmmer.a  ${HDRS} p7_config.h
         fi ;\
 	${CC} ${CFLAGS} ${PTHREAD_CFLAGS}  ${PIC_CFLAGS} ${NEON_CFLAGS} ${SSE_CFLAGS} ${VMX_CFLAGS} ${CPPFLAGS} ${LDFLAGS} ${DEFS} ${MYLIBDIRS} ${MYINCDIRS} -D$${DFLAG} -o $@ $${DFILE} ${LIBS}
 
-${STATS}: libhmmer.a ${HDRS} p7_config.h
+${STATS}: libhmmer.a ${HDRS} p7_config.h p7_gitversion.h
 	@BASENAME=`echo $@ | sed -e 's/_stats//' | sed -e 's/^p7_//'` ;\
 	DFLAG=`echo $${BASENAME} | sed -e 'y/abcdefghijklmnopqrstuvwxyz/ABCDEFGHIJKLMNOPQRSTUVWXYZ/'`;\
 	DFLAG=p7$${DFLAG}_STATS ;\
@@ -325,7 +409,7 @@ ${STATS}: libhmmer.a ${HDRS} p7_config.h
         fi ;\
 	${CC} ${CFLAGS} ${PTHREAD_CFLAGS} ${PIC_CFLAGS} ${NEON_CFLAGS} ${SSE_CFLAGS} ${VMX_CFLAGS} ${CPPFLAGS} ${LDFLAGS} ${DEFS} ${MYLIBDIRS} ${MYINCDIRS} -D$${DFLAG} -o $@ $${DFILE} ${LIBS}
 
-${EXAMPLES}: libhmmer.a ${HDRS} p7_config.h
+${EXAMPLES}: libhmmer.a ${HDRS} p7_config.h p7_gitversion.h
 	@BASENAME=`echo $@ | sed -e 's/_example[0-9]*//' | sed -e 's/^p7_//'` ;\
 	DFLAG=p7`echo $@ | sed -e 's/^p7_//' | sed -e 'y/abcdefghijklmnopqrstuvwxyz/ABCDEFGHIJKLMNOPQRSTUVWXYZ/'`;\
 	if test -e ${srcdir}/p7_$${BASENAME}.c; then \
@@ -359,6 +443,8 @@ clean:
 	${QUIET_SUBDIR0}${IMPLDIR} ${QUIET_SUBDIR1} clean
 	-rm -f *.o *~ Makefile.bak core ${PROGS} ${AUXPROGS} TAGS gmon.out
 	-rm -f libhmmer.a libhmmer-src.stamp
+	-rm -f p7_gitversion.h p7_gitversion.h.tmp
+	-rm -f p7_pz_kernel.pz p7_pz_kernel_pz.o ${PZ_PROGS}
 	-rm -f ${UTESTS}
 	-rm -f ${ITESTS}
 	-rm -f ${STATS}

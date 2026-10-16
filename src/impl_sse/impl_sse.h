@@ -8,6 +8,8 @@
 
 #include <p7_config.h>
 
+#include <stdlib.h>       /* getenv(), for the HMMER_NO_FTZ knob in impl_Init() */
+
 #include "esl_alphabet.h"
 #include "esl_random.h"
 
@@ -352,9 +354,21 @@ extern int p7_ViterbiScore (const ESL_DSQ *dsq, int L, const P7_OPROFILE *om, P7
 /*****************************************************************
  * 4. Implementation specific initialization
  *****************************************************************/
+/* HMMER_NO_FTZ=1 leaves denormals alone, i.e. runs with the MXCSR defaults.
+ *
+ * This exists to answer one question for the PEZY port: these two lines put
+ * the host in FTZ+DAZ, and the device kernel does not reproduce that.  So a
+ * device kernel can only be bit-exact with the host if either the kernel
+ * emulates FTZ or Forward never produces a denormal that changes the answer.
+ * Flipping this knob and diffing the output settles which.  Default behaviour
+ * is unchanged.
+ */
 static inline void
 impl_Init(void)
 {
+  const char *nz = getenv("HMMER_NO_FTZ");
+  if (nz && nz[0] != '0') return;
+
 #ifdef HAVE_FLUSH_ZERO_MODE
   /* In order to avoid the performance penalty dealing with sub-normal
    * values in the floating point calculations, set the processor flag

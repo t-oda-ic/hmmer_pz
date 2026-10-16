@@ -41,6 +41,7 @@
 #include "esl_sse.h"
 
 #include "hmmer.h"
+#include "p7_fbstat.h"
 #include "impl_sse.h"
 
 static int forward_engine (int do_full, const ESL_DSQ *dsq, int L, const P7_OPROFILE *om,                    P7_OMX *fwd, float *opt_sc);
@@ -96,7 +97,12 @@ p7_Forward(const ESL_DSQ *dsq, int L, const P7_OPROFILE *om, P7_OMX *ox, float *
   if (! p7_oprofile_IsLocal(om)) ESL_EXCEPTION(eslEINVAL, "Forward implementation makes assumptions that only work for local alignment");
 #endif
 
-  return forward_engine(TRUE, dsq, L, om, ox, opt_sc);
+  {
+    P7_FBSTAT_T0(t0);
+    int st = forward_engine(TRUE, dsq, L, om, ox, opt_sc);
+    P7_FBSTAT_T1(t0, P7_FBS_FWD_FULL, om->M, L);
+    return st;
+  }
 }
 
 /* Function:  p7_ForwardParser()
@@ -138,7 +144,12 @@ p7_ForwardParser(const ESL_DSQ *dsq, int L, const P7_OPROFILE *om, P7_OMX *ox, f
   if (! p7_oprofile_IsLocal(om)) ESL_EXCEPTION(eslEINVAL, "Forward implementation makes assumptions that only work for local alignment");
 #endif
 
-  return forward_engine(FALSE, dsq, L, om, ox, opt_sc);
+  {
+    P7_FBSTAT_T0(t0);
+    int st = forward_engine(FALSE, dsq, L, om, ox, opt_sc);
+    P7_FBSTAT_T1(t0, P7_FBS_FWD_PARSE, om->M, L);
+    return st;
+  }
 }
 
 
@@ -197,7 +208,12 @@ p7_Backward(const ESL_DSQ *dsq, int L, const P7_OPROFILE *om, const P7_OMX *fwd,
   if (! p7_oprofile_IsLocal(om))  ESL_EXCEPTION(eslEINVAL, "Forward implementation makes assumptions that only work for local alignment");
 #endif
 
- return backward_engine(TRUE, dsq, L, om, fwd, bck, opt_sc);
+ {
+    P7_FBSTAT_T0(t0);
+    int st = backward_engine(TRUE, dsq, L, om, fwd, bck, opt_sc);
+    P7_FBSTAT_T1(t0, P7_FBS_BCK_FULL, om->M, L);
+    return st;
+  }
 }
 
 
@@ -243,7 +259,12 @@ p7_BackwardParser(const ESL_DSQ *dsq, int L, const P7_OPROFILE *om, const P7_OMX
   if (! p7_oprofile_IsLocal(om))  ESL_EXCEPTION(eslEINVAL, "Forward implementation makes assumptions that only work for local alignment");
 #endif
 
-  return backward_engine(FALSE, dsq, L, om, fwd, bck, opt_sc);
+  {
+    P7_FBSTAT_T0(t0);
+    int st = backward_engine(FALSE, dsq, L, om, fwd, bck, opt_sc);
+    P7_FBSTAT_T1(t0, P7_FBS_BCK_PARSE, om->M, L);
+    return st;
+  }
 }
 
 

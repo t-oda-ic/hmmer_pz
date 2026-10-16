@@ -19,6 +19,8 @@
 #include "esl_vectorops.h"
 
 #include "hmmer.h"
+#include "p7_fbstat.h"
+
 
 #include "esl_sqio.h" //!!!!DEBUG
 
@@ -466,6 +468,26 @@ p7_pli_DomainIncludable(P7_PIPELINE *pli, float dom_score, double lnP)
 
 
 
+static int
+pli_newmodel(P7_PIPELINE *pli, const P7_OPROFILE *om, P7_BG *bg, int do_setfilter)
+{
+  int status = eslOK;
+
+  pli->nmodels++;
+  pli->nnodes += om->M;
+  if (pli->Z_setby == p7_ZSETBY_NTARGETS && pli->mode == p7_SCAN_MODELS) pli->Z = pli->nmodels;
+
+  if (pli->do_biasfilter && do_setfilter) p7_bg_SetFilter(bg, om->M, om->compo);
+
+  if (pli->mode == p7_SEARCH_SEQS)
+    status = p7_pli_NewModelThresholds(pli, om);
+
+  pli->W = om->max_length;
+
+  return status;
+}
+
+
 /* Function:  p7_pli_NewModel()
  * Synopsis:  Prepare pipeline for a new model (target or query)
  *
@@ -491,20 +513,27 @@ p7_pli_DomainIncludable(P7_PIPELINE *pli, float dom_score, double lnP)
 int
 p7_pli_NewModel(P7_PIPELINE *pli, const P7_OPROFILE *om, P7_BG *bg)
 {
-  int status = eslOK;
+  return pli_newmodel(pli, om, bg, TRUE);
+}
 
-  pli->nmodels++;
-  pli->nnodes += om->M;
-  if (pli->Z_setby == p7_ZSETBY_NTARGETS && pli->mode == p7_SCAN_MODELS) pli->Z = pli->nmodels;
-
-  if (pli->do_biasfilter) p7_bg_SetFilter(bg, om->M, om->compo);
-
-  if (pli->mode == p7_SEARCH_SEQS)
-    status = p7_pli_NewModelThresholds(pli, om);
-
-  pli->W = om->max_length;
-
-  return status;
+/* Function:  p7_pli_NewModelNoBias()
+ * Synopsis:  <p7_pli_NewModel()> without rebuilding the bias filter HMM.
+ *
+ * Purpose:   Same as <p7_pli_NewModel()>, except that <p7_bg_SetFilter()> is
+ *            not called: the caller has already put a filter HMM configured
+ *            for this model into <bg>.
+ *
+ *            This exists because <p7_bg_SetFilter()> depends only on the
+ *            model, yet hmmscan calls it once per (model, query) pair.  Over a
+ *            pressed Pfam-A and a multi-sequence query that is over a quarter
+ *            of all remaining CPU time, and it is entirely recomputation.
+ *
+ * Returns:   as <p7_pli_NewModel()>.
+ */
+int
+p7_pli_NewModelNoBias(P7_PIPELINE *pli, const P7_OPROFILE *om, P7_BG *bg)
+{
+  return pli_newmodel(pli, om, bg, FALSE);
 }
 
 /* Function:  p7_pli_NewModelThresholds()
@@ -575,12 +604,7 @@ p7_pli_NewModelThresholds(P7_PIPELINE *pli, const P7_OPROFILE *om)
 int
 p7_pli_NewSeq(P7_PIPELINE *pli, const ESL_SQ *sq)
 {
-  if (! pli->long_targets) {  // if long_targets, sequence counting happens in main loop of the master thread, which can track multiple windows for a single long sequence
-    pli->nseqs++;             
-    if (pli->Z_setby == p7_ZSETBY_NTARGETS && pli->mode == p7_SEARCH_SEQS) pli->Z = pli->nseqs; //  ... whereas worker threads call p7_pli_NewSeq(), so pli->nseqs can't even be read, when in longtargets mode
-  }
-  pli->nres += sq->n;  
-  return eslOK;
+  return p7_pli_NewSeqLength(pli, sq->n);
 
   // Note on what nhmmer (long_targets mode) is doing w.r.t. threads and nseqs/nres.
   //
@@ -597,6 +621,28 @@ p7_pli_NewSeq(P7_PIPELINE *pli, const ESL_SQ *sq)
   // hmmsearch does, we can just have p7_pli_NewSeq() update nres
   // and ignore anything having to do with nseqs.
 }
+
+/* Function:  p7_pli_NewSeqLength()
+ * Synopsis:  Same bookkeeping as <p7_pli_NewSeq()>, from the length alone.
+ *
+ * Purpose:   <p7_pli_NewSeq()> only ever looks at <sq->n>.  The PEZY offload
+ *            knows the length of every target sequence without having built an
+ *            <ESL_SQ> for it -- it only materializes the ones that survive the
+ *            filters -- so it needs this entry point.
+ *
+ * Returns:   <eslOK> on success.
+ */
+int
+p7_pli_NewSeqLength(P7_PIPELINE *pli, int64_t L)
+{
+  if (! pli->long_targets) {  /* in long_targets mode the master thread counts sequences, so a worker must not touch nseqs */
+    pli->nseqs++;
+    if (pli->Z_setby == p7_ZSETBY_NTARGETS && pli->mode == p7_SEARCH_SEQS) pli->Z = pli->nseqs;
+  }
+  pli->nres += L;
+  return eslOK;
+}
+
 
 /* Function:  p7_pipeline_Merge()
  * Synopsis:  Merge the pipeline statistics
@@ -693,24 +739,39 @@ p7_pipeline_Merge(P7_PIPELINE *p1, P7_PIPELINE *p2)
  *            and handle normal errors appropriately, which we haven't 
  *            been careful enough about. [SRE H9/4]
  */
+/* Function:  p7_Pipeline_ToFwd()
+ * Synopsis:  The acceleration pipeline, up to but not including Forward.
+ *
+ * Purpose:   Runs everything <pipeline_engine()> does before it calls
+ *            <p7_ForwardParser()>: the MSV/SSV filter (or <opt_usc>, a score
+ *            the caller already has), the bias filter, and the Viterbi filter.
+ *            The null and bias scores the rest of the pipeline needs are
+ *            returned in <ret_nullsc> and <ret_filtersc>.
+ *
+ *            This exists so that Forward can be run for a whole batch of
+ *            targets at once -- on a PEZY-SC device, one target per thread --
+ *            instead of one target at a time.  Splitting the pipeline here is
+ *            what makes that possible: everything above the split needs only
+ *            (dsq, L, om, bg), and everything below needs only the Forward
+ *            matrix and these three scores.  See p7_pzscan.c.
+ *
+ * Returns:   <eslOK> if the target reached Forward.
+ *            <eslEOD> if a filter rejected it, or the sequence was empty; the
+ *            caller is done with this target and should just move on.
+ *
+ * Throws:    <eslETYPE> if the target is too long for this pipeline.
+ */
 int
-p7_Pipeline(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist)
+p7_Pipeline_ToFwd(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq,
+                  const float *opt_usc, float *ret_nullsc, float *ret_filtersc)
 {
-  P7_HIT          *hit     = NULL;     /* ptr to the current hit output data      */
-  float            usc, vfsc, fwdsc;   /* filter scores                           */
+  float            usc, vfsc;         /* filter scores                           */
   float            filtersc;           /* HMM null filter score                   */
   float            nullsc;             /* null model score                        */
-  float            seqbias;  
-  float            seq_score;          /* the corrected per-seq bit score */
-  float            sum_score;           /* the corrected reconstruction score for the seq */
-  float            pre_score, pre2_score; /* uncorrected bit scores for seq */
-  double           P;                /* P-value of a hit */
-  double           lnP;              /* log P-value of a hit */
-  int              Ld;               /* # of residues in envelopes */
-  int              d;
+  float            seq_score;          /* the corrected per-seq bit score         */
+  double           P;                  /* P-value of a hit                        */
   int              status;
-  
-  if (sq->n == 0) return eslOK;    /* silently skip length 0 seqs; they'd cause us all sorts of weird problems */
+  if (sq->n == 0) return eslEOD;   /* silently skip length 0 seqs; they'd cause us all sorts of weird problems */
   if (sq->n > 100000) ESL_EXCEPTION(eslETYPE, "Target sequence length > 100K, over comparison pipeline limit.\n(Did you mean to use nhmmer/nhmmscan?)");
 
   p7_omx_GrowTo(pli->oxf, om->M, 0, sq->n);    /* expand the one-row omx if needed */
@@ -718,11 +779,14 @@ p7_Pipeline(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, cons
   /* Base null model score (we could calculate this in NewSeq(), for a scan pipeline) */
   p7_bg_NullOne  (bg, sq->dsq, sq->n, &nullsc);
 
-  /* First level filter: the MSV filter, multihit with <om> */
-  p7_MSVFilter(sq->dsq, sq->n, om, pli->oxf, &usc);
+  /* First level filter: the MSV filter, multihit with <om>.
+   * <opt_usc> lets a caller supply a score it has already obtained -- see
+   * p7_Pipeline_MSVDone(). */
+  if (opt_usc) { pli->oxf->M = om->M; usc = *opt_usc; }
+  else         p7_MSVFilter(sq->dsq, sq->n, om, pli->oxf, &usc);
   seq_score = (usc - nullsc) / eslCONST_LOG2;
   P = esl_gumbel_surv(seq_score,  om->evparam[p7_MMU],  om->evparam[p7_MLAMBDA]);
-  if (P > pli->F1) return eslOK;
+  if (P > pli->F1) return eslEOD;
   pli->n_past_msv++;
 
   /* biased composition HMM filtering */
@@ -731,7 +795,7 @@ p7_Pipeline(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, cons
       p7_bg_FilterScore(bg, sq->dsq, sq->n, &filtersc);
       seq_score = (usc - filtersc) / eslCONST_LOG2;
       P = esl_gumbel_surv(seq_score,  om->evparam[p7_MMU],  om->evparam[p7_MLAMBDA]);
-      if (P > pli->F1) return eslOK;
+      if (P > pli->F1) return eslEOD;
     }
   else filtersc = nullsc;
   pli->n_past_bias++;
@@ -747,24 +811,105 @@ p7_Pipeline(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, cons
   /* Second level filter: ViterbiFilter(), multihit with <om> */
   if (P > pli->F2)
     {
-      p7_ViterbiFilter(sq->dsq, sq->n, om, pli->oxf, &vfsc);  
+      { P7_FBSTAT_T0(_fbs_t0);
+        p7_ViterbiFilter(sq->dsq, sq->n, om, pli->oxf, &vfsc);
+        P7_FBSTAT_T1(_fbs_t0, P7_FBS_VITFILTER, om->M, sq->n); }  
       seq_score = (vfsc-filtersc) / eslCONST_LOG2;
       P  = esl_gumbel_surv(seq_score,  om->evparam[p7_VMU],  om->evparam[p7_VLAMBDA]);
-      if (P > pli->F2) return eslOK;
+      if (P > pli->F2) return eslEOD;
     }
   pli->n_past_vit++;
 
 
-  /* Parse it with Forward and obtain its real Forward score. */
-  p7_ForwardParser(sq->dsq, sq->n, om, pli->oxf, &fwdsc);
+
+  *ret_nullsc   = nullsc;
+  *ret_filtersc = filtersc;
+  return eslOK;
+}
+
+
+/* Function:  p7_Pipeline_FromFwd()
+ * Synopsis:  The acceleration pipeline, from Forward onwards.
+ *
+ * Purpose:   The other half of <p7_Pipeline_ToFwd()>: the F3 threshold, the
+ *            Backward parser pass, domain definition, and the hit list.
+ *            <nullsc> and <filtersc> are what <p7_Pipeline_ToFwd()> returned.
+ *
+ *            <opt_dev> is <NULL> on the ordinary one-target-at-a-time path,
+ *            and this then runs <p7_ForwardParser()> and
+ *            <p7_BackwardParser()> itself.  Otherwise it carries what a device
+ *            batch already computed for this target.
+ *
+ *            The matrices in <opt_dev> are copied into <pli->oxf>/<pli->oxb>
+ *            only AFTER the F3 test, because the test needs nothing but
+ *            <opt_dev->fwdsc> and about half of the targets that reach here
+ *            fail it -- copying first was measurably slower.
+ *
+ * Returns:   <eslOK> on success, whether or not a hit was stored.
+ */
+int
+p7_Pipeline_FromFwd(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq,
+                    const ESL_SQ *ntsq, P7_TOPHITS *hitlist,
+                    float nullsc, float filtersc, const P7_PLI_DEVFB *opt_dev)
+{
+  P7_HIT          *hit     = NULL;     /* ptr to the current hit output data      */
+  float            fwdsc;              /* Forward score                           */
+  float            seqbias;
+  float            seq_score;          /* the corrected per-seq bit score         */
+  float            sum_score;          /* the corrected reconstruction score      */
+  float            pre_score, pre2_score; /* uncorrected bit scores for seq       */
+  double           P;                  /* P-value of a hit                        */
+  double           lnP;                /* log P-value of a hit                    */
+  int              Ld;                 /* # of residues in envelopes              */
+  int              d;
+  int              status;
+  /* Parse it with Forward and obtain its real Forward score -- unless the
+   * caller already has it, in which case pli->oxf already holds the matrix.
+   *
+   * The GrowTo is not redundant with the one in p7_Pipeline_ToFwd(): the two
+   * halves may run on different threads with different pipelines, and this
+   * one's oxf may last have been sized for a shorter target.  Without it,
+   * p7_ForwardParser() writes past the end of oxf->xmx and corrupts the heap.
+   * (It is a no-op on the one-target-at-a-time path, where ToFwd already grew
+   * this same oxf.)  We must NOT grow it in the other branch: the caller has
+   * already filled it, and a realloc would throw the matrix away. */
+  if (opt_dev) fwdsc = opt_dev->fwdsc;
+  else {
+    p7_omx_GrowTo(pli->oxf, om->M, 0, sq->n);
+    p7_ForwardParser(sq->dsq, sq->n, om, pli->oxf, &fwdsc);
+  }
   seq_score = (fwdsc-filtersc) / eslCONST_LOG2;
   P = esl_exp_surv(seq_score,  om->evparam[p7_FTAU],  om->evparam[p7_FLAMBDA]);
   if (P > pli->F3) return eslOK;
   pli->n_past_fwd++;
 
-  /* ok, it's for real. Now a Backwards parser pass, and hand it to domain definition workflow */
-  p7_omx_GrowTo(pli->oxb, om->M, 0, sq->n);
-  p7_BackwardParser(sq->dsq, sq->n, om, pli->oxf, pli->oxb, NULL);
+  /* ok, it's for real.  Now that we know the target survives, materialize the
+   * device's Forward matrix; then the Backwards parser pass, or the device's
+   * matrix for that too. */
+  if (opt_dev)
+    {
+      p7_omx_GrowTo(pli->oxf, om->M, 0, sq->n);
+      pli->oxf->M              = om->M;
+      pli->oxf->L              = sq->n;
+      pli->oxf->has_own_scales = TRUE;
+      pli->oxf->totscale       = opt_dev->ftotscale;
+      memcpy(pli->oxf->xmx, opt_dev->fxmx, sizeof(float) * (size_t) (sq->n + 1) * p7X_NXCELLS);
+    }
+
+  if (opt_dev && opt_dev->bxmx)
+    {
+      p7_omx_GrowTo(pli->oxb, om->M, 0, sq->n);
+      pli->oxb->M              = om->M;
+      pli->oxb->L              = sq->n;
+      pli->oxb->has_own_scales = opt_dev->bown;
+      pli->oxb->totscale       = opt_dev->btotscale;
+      memcpy(pli->oxb->xmx, opt_dev->bxmx, sizeof(float) * (size_t) (sq->n + 1) * p7X_NXCELLS);
+    }
+  else
+    {
+      p7_omx_GrowTo(pli->oxb, om->M, 0, sq->n);
+      p7_BackwardParser(sq->dsq, sq->n, om, pli->oxf, pli->oxb, NULL);
+    }
 
   status = p7_domaindef_ByPosteriorHeuristics(sq, ntsq, om, pli->oxf, pli->oxb, pli->fwd, pli->bck, pli->ddef, bg, FALSE, NULL, NULL, NULL);
   if (status != eslOK) ESL_FAIL(status, pli->errbuf, "domain definition workflow failure"); /* eslERANGE can happen  */
@@ -934,6 +1079,22 @@ p7_Pipeline(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, cons
 
   return eslOK;
 }
+
+
+static int
+pipeline_engine(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist,
+                const float *opt_usc)
+{
+  float nullsc, filtersc;
+  int   status;
+
+  status = p7_Pipeline_ToFwd(pli, om, bg, sq, opt_usc, &nullsc, &filtersc);
+  if      (status == eslEOD) return eslOK;      /* a filter rejected it */
+  else if (status != eslOK)  return status;
+
+  return p7_Pipeline_FromFwd(pli, om, bg, sq, ntsq, hitlist, nullsc, filtersc, NULL);
+}
+
 
 
 
@@ -1439,6 +1600,36 @@ p7_pli_postSSV_LongTarget(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, P7_TOPHI
 
 
 
+
+int
+p7_Pipeline(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist)
+{
+  return pipeline_engine(pli, om, bg, sq, ntsq, hitlist, NULL);
+}
+
+/* Function:  p7_Pipeline_MSVDone()
+ * Synopsis:  <p7_Pipeline()> with the MSV score supplied by the caller.
+ *
+ * Purpose:   Identical to <p7_Pipeline()> except that the MSV filter is not
+ *            run: <usc> is the score <p7_MSVFilter()> would have returned for
+ *            <sq>.  Everything downstream -- the F1 test, the bias filter, the
+ *            Viterbi and Forward filters, domain definition and scoring -- is
+ *            the same code, so results are unchanged.
+ *
+ *            This exists for the PEZY-SC offload, which computes the MSV/SSV
+ *            score for the whole target database on the device in one pass.
+ *            Note that the F1 test is repeated here rather than trusted from
+ *            the caller, so that <pli>'s counters advance exactly as they do
+ *            in the unaccelerated pipeline.
+ *
+ * Returns:   as <p7_Pipeline()>.
+ */
+int
+p7_Pipeline_MSVDone(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq,
+                    P7_TOPHITS *hitlist, float usc)
+{
+  return pipeline_engine(pli, om, bg, sq, ntsq, hitlist, &usc);
+}
 
 /* Function:  p7_Pipeline_LongTarget()
  * Synopsis:  Accelerated seq/profile comparison pipeline for long target sequences.

@@ -29,6 +29,12 @@
 #endif
 
 #include "hmmer.h"
+#ifdef HAVE_PEZY
+#include "p7_pzscan.h"
+#define PZ_ACTIVE (pzsc != NULL)
+#else
+#define PZ_ACTIVE 0
+#endif
 
 typedef struct {
 #ifdef HMMER_THREADS
@@ -178,7 +184,7 @@ process_commandline(int argc, char **argv, ESL_GETOPTS **ret_go, char **ret_qfil
   /* help format: */
   if (esl_opt_GetBoolean(go, "-h") == TRUE) 
     {
-      p7_banner(stdout, argv[0], banner);
+      p7_banner_help(stdout, argv[0], banner);
       esl_usage(stdout, argv[0], usage);
       if (puts("\nBasic options:")                                           < 0) ESL_XEXCEPTION_SYS(eslEWRITE, "write failed");
       esl_opt_DisplayHelp(stdout, go, 1, 2, 80); /* 1= group; 2 = indentation; 120=textwidth*/
@@ -403,6 +409,11 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
   int              ncpus    = 0;
   int              infocnt  = 0;
   WORKER_INFO     *info     = NULL;
+#ifdef HAVE_PEZY
+  P7_PZSCAN       *pzsc     = NULL;              /* PEZY-SC accelerated scan of the target db, or NULL */
+  P7_PZ_WORKER    *pzw      = NULL;
+  char             pzerr[eslERRBUFSIZE];
+#endif
 #ifdef HMMER_THREADS
   ESL_SQ_BLOCK    *block    = NULL;
   ESL_THREADS     *threadObj= NULL;
@@ -505,8 +516,34 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
 #endif
     }
 
+
+#ifdef HAVE_PEZY
+  /* Set up the PEZY-SC accelerated scan if we can; see p7_pzscan.h.  Anything
+   * unusual -- a restricted database range, a device that will not come up, a
+   * file the fast reader will not touch -- leaves pzsc NULL and HMMER's own
+   * loop is used. */
+  if (cfg->n_targetseq < 0 && cfg->firstseq_key == NULL)
+    {
+      int nw = (ncpus > 0 ? ncpus : 1);
+      if (p7_pzscan_Create(cfg->dbfile, abc, nw, BLOCK_SIZE, &pzsc, pzerr) == eslOK)
+        {
+          ESL_ALLOC(pzw, sizeof(P7_PZ_WORKER) * nw);
+          memset(pzw, 0, sizeof(P7_PZ_WORKER) * nw);
+          for (i = 0; i < nw; i++)
+            if (esl_sqfile_Open(cfg->dbfile, dbfp->format, p7_SEQDBENV, &(pzw[i].sqfp)) != eslOK ||
+                esl_sqfile_SetDigital(pzw[i].sqfp, abc) != eslOK)
+              { p7_pzscan_Destroy(pzsc); pzsc = NULL; break; }
+        }
+    }
+#endif
+
 #ifdef HMMER_THREADS
-  for (i = 0; i < ncpus * 2; ++i)
+  /* Only HMMER's own loop needs the reader/work-queue machinery.  Note that
+   * esl_threads_AddThread() starts its pipeline_thread immediately and that
+   * thread blocks on the work queue forever, so the device path must not
+   * create either. */
+  if (! PZ_ACTIVE)
+   for (i = 0; i < ncpus * 2; ++i)
     {
       block = esl_sq_CreateDigitalBlock(BLOCK_SIZE, abc);
       if (block == NULL) 
@@ -565,13 +602,30 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
         p7_pli_NewModel(info[i].pli, info[i].om, info[i].bg);
 
 #ifdef HMMER_THREADS
-        if (ncpus > 0) esl_threads_AddThread(threadObj, &info[i]);
+        if (ncpus > 0 && ! PZ_ACTIVE) esl_threads_AddThread(threadObj, &info[i]);
 #endif
       }
 
+      sstatus = eslENORESULT;
+#ifdef HAVE_PEZY
+      if (PZ_ACTIVE)
+        {
+          int nw = (ncpus > 0 ? ncpus : 1);
+          for (i = 0; i < nw; i++) { pzw[i].om = info[i].om; pzw[i].bg = info[i].bg; pzw[i].pli = info[i].pli; pzw[i].th = info[i].th; }
+          sstatus = p7_pzscan_Run(pzsc, pzw);
+          if      (sstatus == eslOK)   sstatus = eslEOF;
+          else if (sstatus == eslFAIL)   /* launch did not come back clean: its scores are unusable */
+            {
+              fprintf(stderr, "\n# WARNING: a PEZY-SC SSV launch did not complete (see pzcl.log); "
+                              "this model is being filtered on the CPU instead.\n");
+              sstatus = eslENORESULT;
+            }
+        }
+#endif
+      if (sstatus != eslENORESULT) { /* device handled it */ } else
 #ifdef HMMER_THREADS
-      if (ncpus > 0) sstatus = thread_loop(threadObj, queue, dbfp, cfg->n_targetseq);
-      else           sstatus = serial_loop(info, dbfp, cfg->n_targetseq);
+      if (ncpus > 0 && ! PZ_ACTIVE) sstatus = thread_loop(threadObj, queue, dbfp, cfg->n_targetseq);
+      else                          sstatus = serial_loop(info, dbfp, cfg->n_targetseq);
 #else
       sstatus = serial_loop(info, dbfp, cfg->n_targetseq);
 #endif
@@ -655,6 +709,18 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
   if (domtblfp)  p7_tophits_TabularTail(domtblfp, "phmmer", p7_SEARCH_SEQS, cfg->qfile, cfg->dbfile, go);
   if (pfamtblfp) p7_tophits_TabularTail(pfamtblfp,"phmmer", p7_SEARCH_SEQS, cfg->qfile, cfg->dbfile, go);
   if (ofp)    { if (fprintf(ofp, "[ok]\n") < 0) ESL_EXCEPTION_SYS(eslEWRITE, "write failed"); }
+
+#ifdef HAVE_PEZY
+  if (pzw) {
+    int nw = (ncpus > 0 ? ncpus : 1);
+    for (i = 0; i < nw; i++) {
+      if (pzw[i].sqfp) esl_sqfile_Close(pzw[i].sqfp);
+      if (pzw[i].sq)   esl_sq_Destroy(pzw[i].sq);
+    }
+    free(pzw);
+  }
+  if (pzsc) p7_pzscan_Destroy(pzsc);
+#endif
 
   /* Cleanup - prepare for successful exit
    */

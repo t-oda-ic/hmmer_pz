@@ -1164,7 +1164,7 @@ main(int argc, char **argv)
   if (esl_opt_VerifyConfig(go)               != eslOK) esl_fatal(argv[0], "Error in configuration: %s\n",       go->errbuf);
 
   if (esl_opt_GetBoolean(go, "-h") )  {
-    p7_banner (stdout, argv[0], banner);
+    p7_banner_help (stdout, argv[0], banner);
     esl_usage (stdout, argv[0], usage);
     puts("\nBasic options:");
     esl_opt_DisplayHelp(stdout, go, 1, 2, 80);
