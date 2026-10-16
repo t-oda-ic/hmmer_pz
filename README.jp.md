@@ -1,6 +1,6 @@
 # HMMER 3.4 PEZY-SC 対応版
 
-HMMER 3.4 の一部の処理を PEZY-SC3 で実行するように改変した版です。
+HMMER 3.4 の一部の処理を PEZY-SC3 で実行するように改変したバージョンです。
 このファイルでは、このリポジトリのソースからビルドしてインストールする手順と、実行時の動作・設定を説明します。
 本家 HMMER のインストール手順、オプションなどの説明は `official_readme/` 配下のファイルと `Userguide.pdf` にあります。
 
@@ -21,11 +21,11 @@ English version: [README.md](README.md)
 - デバイスを使うのは `hmmsearch`・`phmmer`・`jackhmmer`・`hmmscan` の 4 つです。
   `hmmbuild` などそれ以外のプログラムは本家 HMMER 3.4 と同じく CPU で動きます。
   デバイスを使えない条件のときは、自動で CPU の処理に切り替わります（§5.2）。
-- **PEZY-SC3 が無い環境でも、CPU だけで動く版（CPU 版）をビルドして使えます。**
+- **PEZY-SC3 が無い環境でも、CPU だけで動くバージョン（CPU 版）をビルドして使えます。**
   検索結果は本家 HMMER 3.4 と同じで、`hmmscan` はクエリ配列が多いときに本家より速くなります。
   ビルド方法は §3.5 を見てください。
 - ビルドすると、ソースの commit ID が実行ファイルに埋め込まれ、`-h` の表示と結果ファイルのヘッダに出ます（§4）。
-  どの版で出した結果かを後から確認できます。
+  どのバージョンで出した結果かを後から確認できます。
   - commit ID は git から読むので、`git clone` したツリーでビルドしてください。
     追跡しているファイルに未コミットの変更があると、ID の末尾に `-dirty` が付きます。
   - GitHub の「Download ZIP」などで取得した `.git` の無いツリーでは、ID は `unknown-dirty` になります。
@@ -41,7 +41,7 @@ English version: [README.md](README.md)
 | OS / CPU | Linux x86_64 | 動作確認は AlmaLinux 9.1 |
 | C コンパイラ | **システムの gcc** | 動作確認は gcc 11.3.1。**conda の gcc は使えない**（§7） |
 | make / binutils | GNU make、`objcopy` | `objcopy` でデバイスカーネルを実行ファイルに埋め込む |
-| PZSDK | `<PZSDK>/bin/pzcc`、`<PZSDK>/lib/libpzcl.so`、`pzcl/pzcl.h` | ヘッダは SDK の版によって `include/` か `inc/` にあるが、どちらでも自動で見つかる |
+| PZSDK | `<PZSDK>/bin/pzcc`、`<PZSDK>/lib/libpzcl.so`、`pzcl/pzcl.h` | ヘッダは SDK のバージョンによって `include/` か `inc/` にあるが、どちらでも自動で見つかる |
 | デバイス | PEZY-SC3（ドライバ込み） | 見えているカードは全部使う（動作確認は SC3 × 4） |
 | pthread | 必須 | |
 | git | 推奨 | commit ID の埋め込みに使う（§1）。無くてもビルドはできる |
@@ -55,7 +55,7 @@ PZSDK が見つからない環境でもビルドは通りますが、その場�
 
 ## 3. ビルドとインストール
 
-PEZY-SC3 を使う版（PEZY 版）のビルド手順です。PEZY-SC3 を使わない CPU 版のビルドは §3.5 を見てください。
+PEZY-SC3 を使うバージョン（PEZY 版）のビルド手順です。PEZY-SC3 を使わない CPU 版のビルドは §3.5 を見てください。
 
 ```bash
 git clone https://github.com/t-oda-ic/hmmer_pz.git <SRC>
@@ -109,13 +109,13 @@ make install
 ### 3.2 注意
 
 - **`configure` を作り直さないでください**（`autoconf` や `autoreconf` を実行しない）。
-  同梱の `configure` は、この版で変更した `configure.ac` から autoconf 2.71 で生成したものです。
-  別の版の autoconf で作り直すと内容が変わります。
+  同梱の `configure` は、このバージョンで変更した `configure.ac` から autoconf 2.71 で生成したものです。
+  別のバージョンの autoconf で作り直すと内容が変わります。
 - **一度ビルドしたツリーを別の場所へコピーした場合や、`--prefix` を変える場合は、
   先に `make distclean` を実行してください。**
   `Makefile` と `config.status` には configure を実行したときのインストール先が書き込まれています。
   また、古い `.o` は作り直されません。
-- **SDK の場所や版、`PZ_ARCH`、`HMMER_NO_PEZY` を変えたときは、`make clean` からやり直してください。**
+- **SDK の場所やバージョン、`PZ_ARCH`、`HMMER_NO_PEZY` を変えたときは、`make clean` からやり直してください。**
   これらは make 変数なので、値が変わっても既存の `.o` は作り直されません。
 
 ### 3.3 configure のオプション
@@ -146,7 +146,7 @@ PEZY を組み込むのは、`<PZSDK>/bin/pzcc`、`pzcl/pzcl.h`（`include/` か
 
 ### 3.5 CPU 版のビルド（PEZY-SC3 を使わない場合）
 
-PEZY-SC3 が無い環境でも、CPU だけで動く版（CPU 版）をビルドして使えます。
+PEZY-SC3 が無い環境でも、CPU だけで動くバージョン（CPU 版）をビルドして使えます。
 
 - 必要なものは本家 HMMER 3.4 と同じです。§2 のうち PZSDK、デバイス、`objcopy` は要りません。
 - 検索結果は本家 HMMER 3.4 と同じです。
@@ -215,7 +215,7 @@ ldd <PREFIX>/bin/hmmsearch | grep pzcl
 ```
 
 - `# git commit` の行には、ビルドしたソースの commit ID が出ます（§1）。結果ファイルのヘッダにも同じ行が入るので、
-  どの版で出した結果かを後から確認できます。`# contact` の行は `-h` の表示にだけ出ます。
+  どのバージョンで出した結果かを後から確認できます。`# contact` の行は `-h` の表示にだけ出ます。
 - `PEZY-SC3` は固定の文字列なので、`PZ_ARCH` を変えても表示は変わりません。
 
 デバイスを使えるかどうかは、同梱のチュートリアル用ファイルを使った小さな検索で確認できます。
