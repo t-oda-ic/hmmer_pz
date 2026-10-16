@@ -103,6 +103,7 @@
 #undef HMMER_COPYRIGHT
 #undef HMMER_LICENSE
 #undef HMMER_URL
+#undef HMMER_BUGREPORT
 
 /* Large file support (must precede any header file inclusion.)
  */

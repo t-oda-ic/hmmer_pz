@@ -1410,6 +1410,7 @@ extern int   p7_h2io_WriteASCII(FILE *fp, P7_HMM *hmm);
 
 /* hmmer.c */
 extern void         p7_banner(FILE *fp, const char *progname, char *banner);
+extern void         p7_banner_help(FILE *fp, const char *progname, char *banner);
 extern ESL_GETOPTS *p7_CreateDefaultApp(ESL_OPTIONS *options, int nargs, int argc, char **argv, char *banner, char *usage);
 extern int          p7_AminoFrequencies(float *f);
 
@@ -1643,9 +1644,30 @@ extern int p7_pli_DomainReportable  (P7_PIPELINE *pli, float dom_score, double l
 extern int p7_pli_TargetIncludable  (P7_PIPELINE *pli, float score,     double lnP);
 extern int p7_pli_DomainIncludable  (P7_PIPELINE *pli, float dom_score, double lnP);
 extern int p7_pli_NewModel          (P7_PIPELINE *pli, const P7_OPROFILE *om, P7_BG *bg);
+extern int p7_pli_NewModelNoBias    (P7_PIPELINE *pli, const P7_OPROFILE *om, P7_BG *bg);
 extern int p7_pli_NewModelThresholds(P7_PIPELINE *pli, const P7_OPROFILE *om);
 extern int p7_pli_NewSeq            (P7_PIPELINE *pli, const ESL_SQ *sq);
+extern int p7_pli_NewSeqLength      (P7_PIPELINE *pli, int64_t L);
 extern int p7_Pipeline              (P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *th);
+/* What a device batch produced for one target, for p7_Pipeline_FromFwd().
+ * The two matrices stay where the device left them: FromFwd copies them into
+ * pli->oxf / pli->oxb only if the target passes F3, which about half do not.
+ */
+typedef struct {
+  const float *fxmx;       /* parser Forward xmx,  (L+1)*p7X_NXCELLS floats  */
+  const float *bxmx;       /* parser Backward xmx, or NULL to run it here    */
+  float        fwdsc;      /* the Forward score, for the F3 test             */
+  float        ftotscale;
+  float        btotscale;
+  int          bown;       /* what backward_engine's has_own_scales would be */
+} P7_PLI_DEVFB;
+
+extern int p7_Pipeline_ToFwd  (P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq,
+			       const float *opt_usc, float *ret_nullsc, float *ret_filtersc);
+extern int p7_Pipeline_FromFwd(P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq,
+			       const ESL_SQ *ntsq, P7_TOPHITS *hitlist,
+			       float nullsc, float filtersc, const P7_PLI_DEVFB *opt_dev);
+extern int p7_Pipeline_MSVDone      (P7_PIPELINE *pli, P7_OPROFILE *om, P7_BG *bg, const ESL_SQ *sq, const ESL_SQ *ntsq, P7_TOPHITS *hitlist, float usc);
 extern int p7_Pipeline_LongTarget   (P7_PIPELINE *pli, P7_OPROFILE *om, P7_SCOREDATA *data,
                                      P7_BG *bg, P7_TOPHITS *hitlist, int64_t seqidx,
                                      const ESL_SQ *sq, int complementarity,

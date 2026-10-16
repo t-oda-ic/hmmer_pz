@@ -39,7 +39,7 @@ cmdline_failure(char *argv0, char *format, ...)
 static void
 cmdline_help(char *argv0, ESL_GETOPTS *go) 
 {
-  esl_banner(stdout, argv0, banner);
+  p7_banner_help(stdout, argv0, banner);   /* not esl_banner(): this is an HMMER app, and its -h should carry the build id like the rest */
   esl_usage (stdout, argv0, usage1);
   esl_usage (stdout, argv0, usage2);
   esl_usage (stdout, argv0, usage3);

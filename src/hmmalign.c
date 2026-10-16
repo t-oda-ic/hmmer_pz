@@ -59,7 +59,7 @@ cmdline_failure(char *argv0, char *format, ...)
 static void
 cmdline_help(char *argv0, ESL_GETOPTS *go) 
 {
-  p7_banner (stdout, argv0, banner);
+  p7_banner_help (stdout, argv0, banner);
   esl_usage (stdout, argv0, usage);
   puts("\nBasic options:");
   esl_opt_DisplayHelp(stdout, go, 1, 2, 80);

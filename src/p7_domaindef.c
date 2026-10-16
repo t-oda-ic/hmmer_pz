@@ -43,6 +43,10 @@
 #include "esl_vectorops.h"
 
 #include "hmmer.h"
+#include "p7_fbstat.h"
+
+#define FBS(slot, M, L, stmt) do { P7_FBSTAT_T0(_fbs_t0); stmt; P7_FBSTAT_T1(_fbs_t0, (slot), (M), (L)); } while (0)
+
 
 static int is_multidomain_region  (P7_DOMAINDEF *ddef, int i, int j);
 static int region_trace_ensemble  (P7_DOMAINDEF *ddef, const P7_OPROFILE *om, const ESL_DSQ *dsq, int ireg, int jreg, const P7_OMX *fwd, P7_OMX *wrk, int *ret_nc);
@@ -397,7 +401,8 @@ p7_domaindef_ByPosteriorHeuristics(const ESL_SQ *sq, const ESL_SQ *ntsq, P7_OPRO
   int status;
 
   if ((status = p7_domaindef_GrowTo(ddef, sq->n))      != eslOK) return status;  /* ddef's btot,etot,mocc now ready for seq of length n */
-  if ((status = p7_DomainDecoding(om, oxf, oxb, ddef)) != eslOK) return status;  /* ddef->{btot,etot,mocc} now made.                    */
+  FBS(P7_FBS_DOMDECODE, om->M, sq->n, status = p7_DomainDecoding(om, oxf, oxb, ddef));
+  if (status != eslOK) return status;            /* ddef->{btot,etot,mocc} now made.                    */
 
   esl_vec_FSet(ddef->n2sc, sq->n+1, 0.0);          /* ddef->n2sc null2 scores are initialized                        */
   ddef->nexpected = ddef->btot[sq->n];             /* posterior expectation for # of domains (same as etot[sq->n])   */
@@ -615,7 +620,7 @@ region_trace_ensemble(P7_DOMAINDEF *ddef, const P7_OPROFILE *om, const ESL_DSQ *
   /* Collect an ensemble of sampled traces; calculate null2 odds ratios from these */
   for (t = 0; t < ddef->nsamples; t++)
     {
-      p7_StochasticTrace(ddef->r, dsq+ireg-1, Lr, om, fwd, ddef->tr);
+      FBS(P7_FBS_STOTRACE, om->M, Lr, p7_StochasticTrace(ddef->r, dsq+ireg-1, Lr, om, fwd, ddef->tr));
       p7_trace_Index(ddef->tr);
 
       pos = 1;
@@ -623,7 +628,7 @@ region_trace_ensemble(P7_DOMAINDEF *ddef, const P7_OPROFILE *om, const ESL_DSQ *
 	{
 	  p7_spensemble_Add(ddef->sp, t, ddef->tr->sqfrom[d]+ireg-1, ddef->tr->sqto[d]+ireg-1, ddef->tr->hmmfrom[d], ddef->tr->hmmto[d]);
 
-	  p7_Null2_ByTrace(om, ddef->tr, ddef->tr->tfrom[d], ddef->tr->tto[d], wrk, null2);
+	  FBS(P7_FBS_NULL2_TRACE, om->M, Lr, p7_Null2_ByTrace(om, ddef->tr, ddef->tr->tfrom[d], ddef->tr->tto[d], wrk, null2));
 	  
 	  /* residues outside domains get bumped +1: because f'(x) = f(x), so f'(x)/f(x) = 1 in these segments */
 	  for (; pos <= ddef->tr->sqfrom[d]; pos++) ddef->n2sc[ireg+pos-1] += 1.0;
@@ -843,7 +848,7 @@ rescore_isolated_domain(P7_DOMAINDEF *ddef, P7_OPROFILE *om, const ESL_SQ *sq, c
   p7_Forward (sq->dsq + i-1, Ld, om,      ox1, &envsc);
   p7_Backward(sq->dsq + i-1, Ld, om, ox1, ox2, NULL);
 
-  status = p7_Decoding(om, ox1, ox2, ox2);      /* <ox2> is now overwritten with post probabilities     */
+  FBS(P7_FBS_DECODING, om->M, Ld, status = p7_Decoding(om, ox1, ox2, ox2));      /* <ox2> is now overwritten with post probabilities     */
   if (status == eslERANGE) { /* rare: numeric overflow; domain is assumed to be repetitive garbage [J3/119-121] */
     if (long_target && scores_arr) 
       reparameterize_model(bg, om, NULL, 0, 0, fwd_emissions_arr, bg_tmp->f, scores_arr); /* revert to original bg model */
@@ -852,8 +857,8 @@ rescore_isolated_domain(P7_DOMAINDEF *ddef, P7_OPROFILE *om, const ESL_SQ *sq, c
   }
 
   /* Find an optimal accuracy alignment */
-  p7_OptimalAccuracy(om, ox2, ox1, &oasc);      /* <ox1> is now overwritten with OA scores              */
-  p7_OATrace        (om, ox2, ox1, ddef->tr);   /* <tr>'s seq coords are offset by i-1, rel to orig dsq */
+  FBS(P7_FBS_OPTACC, om->M, Ld, p7_OptimalAccuracy(om, ox2, ox1, &oasc));      /* <ox1> is now overwritten with OA scores              */
+  FBS(P7_FBS_OATRACE, om->M, Ld, p7_OATrace(om, ox2, ox1, ddef->tr));   /* <tr>'s seq coords are offset by i-1, rel to orig dsq */
 
   /* hack the trace's sq coords to be correct w.r.t. original dsq */
   for (z = 0; z < ddef->tr->N; z++)
@@ -898,7 +903,7 @@ rescore_isolated_domain(P7_DOMAINDEF *ddef, P7_OPROFILE *om, const ESL_SQ *sq, c
       p7_Forward (sq->dsq + i-1, Ld, om,      ox1, &envsc);
       p7_Backward(sq->dsq + i-1, Ld, om, ox1, ox2, NULL);
 
-      status = p7_Decoding(om, ox1, ox2, ox2);      /* <ox2> is now overwritten with post probabilities     */
+      FBS(P7_FBS_DECODING, om->M, Ld, status = p7_Decoding(om, ox1, ox2, ox2));      /* <ox2> is now overwritten with post probabilities     */
       if (status == eslERANGE) { /* rare: numeric overflow; domain is assumed to be repetitive garbage [J3/119-121] */
           reparameterize_model(bg, om, NULL, 0, 0, fwd_emissions_arr, bg_tmp->f, scores_arr); /* revert to original bg model */
           status = eslFAIL;
@@ -906,9 +911,9 @@ rescore_isolated_domain(P7_DOMAINDEF *ddef, P7_OPROFILE *om, const ESL_SQ *sq, c
       }
 
       /* Find an optimal accuracy alignment */
-      p7_OptimalAccuracy(om, ox2, ox1, &oasc);      /* <ox1> is now overwritten with OA scores              */
+      FBS(P7_FBS_OPTACC, om->M, Ld, p7_OptimalAccuracy(om, ox2, ox1, &oasc));      /* <ox1> is now overwritten with OA scores              */
       p7_trace_Reuse(ddef->tr);
-      p7_OATrace        (om, ox2, ox1, ddef->tr);   /* <tr>'s seq coords are offset by i-1, rel to orig dsq */
+      FBS(P7_FBS_OATRACE, om->M, Ld, p7_OATrace(om, ox2, ox1, ddef->tr));   /* <tr>'s seq coords are offset by i-1, rel to orig dsq */
 
       /* re-hack the trace's sq coords to be correct w.r.t. original dsq */
        for (z = 0; z < ddef->tr->N; z++)
@@ -946,7 +951,7 @@ rescore_isolated_domain(P7_DOMAINDEF *ddef, P7_OPROFILE *om, const ESL_SQ *sq, c
      * do it now, by the expectation (posterior decoding) method.
      */
       if (!null2_is_done) {
-        p7_Null2_ByExpectation(om, ox2, null2);
+        FBS(P7_FBS_NULL2_EXP, om->M, Ld, p7_Null2_ByExpectation(om, ox2, null2));
         for (pos = i; pos <= j; pos++)
           ddef->n2sc[pos]  = logf(null2[sq->dsq[pos]]);
       }

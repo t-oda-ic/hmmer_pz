@@ -1,0 +1,1260 @@
+/* p7_pz_kernel.pzc
+ *
+ * PEZY-SC device kernels for HMMER's acceleration pipeline.
+ *
+ * Implements the SSV filter (the single-ungapped-diagonal MSV approximation
+ * of impl_sse/ssvfilter.c), batched over many target sequences against one
+ * query model.
+ *
+ * WHY THIS IS BIT-EXACT
+ * =====================
+ * The SSV filter is pure 8-bit integer arithmetic:
+ *
+ *      S(i,k) = sat_sub_i8( S(i-1,k-1), sb[dsq[i]][k] )
+ *      S(i,0) = S(0,k) = -128            (-infinity, and also the B->Mk begin)
+ *      xE     = max_over_all_cells( raw_byte(S(i,k)) )
+ *
+ * Saturation at -128 is what implements "a new diagonal may begin at any
+ * (i,k)", so every cell is a plain function of its up-left neighbour and the
+ * final reduction is an order-independent unsigned-byte max.  Any parallel
+ * decomposition therefore reproduces the striped SSE implementation's xE
+ * exactly.  (In the overflow regime the SSE code's `_mm_or_si128(sv, beginv)`
+ * can inflate values, but p7_SSVFilter() then discards the value and returns
+ * eslINFINITY; both implementations agree on the overflow predicate.  Verified
+ * over all of UniProtKB/Swiss-Prot for every model in the benchmark.)
+ *
+ * No floating point happens on the device: the host keeps p7_SSVFilter()'s
+ * float tail verbatim.
+ *
+ * WORK DECOMPOSITION
+ * ==================
+ * One work item = a contiguous band of rows [a..b] of one sequence.  Because a
+ * cell (i,k) depends only on residues i-k+1..i, a band can be computed exactly
+ * on its own provided it is preceded by an (M-1)-residue warm-up.  Warm-up
+ * rows are also scored, which is harmless: their chains start late, so their
+ * values can only be <= the true ones, and the true values are contributed by
+ * the band that owns those rows.
+ *
+ * Splitting long sequences this way is what makes the device usable: in
+ * Swiss-Prot the longest sequence is 35213 residues, several times the ideal
+ * per-thread load, so with one sequence per thread the whole kernel would wait
+ * on that one thread no matter how many PEs there are.
+ *
+ * Items are handed out through an atomic counter, so a thread that draws a
+ * batch of short sequences comes back for more.
+ *
+ * THE <counter> ARRAY (all three kernels)
+ * ======================================
+ *   counter[0]           work cursor.  The host seeds it with the FIRST item
+ *                        of the range it wants run, and passes the item one
+ *                        PAST the last as <nitem>.  A launch therefore covers
+ *                        [seed, nitem), which is how the host keeps any single
+ *                        launch shorter than the driver's kernel watchdog.
+ *   counter[PZ_CNT_DONE] threads that ran to completion.  The host checks
+ *                        this tally after every launch and uses the output
+ *                        only if every thread reported.
+ *                        It sits 64 bytes away from the cursor so that the
+ *                        two counters do not interfere.
+ *
+ * ARGUMENT COUNT: both kernels take 10 arguments.  Keep it there: per-item
+ * data is packed into three arrays rather than passed as separate
+ * off[]/len[]/chunk, and new kernel arguments should be packed the same way.
+ *
+ * Target: PEZY-SC3.
+ */
+#include <pzc_builtin.h>
+
+/* sync_pe(): barrier over the 8 threads of one PE.  The sync level number for
+ * that scope depends on the device generation. */
+static inline void sync_pe(void)
+{
+#if defined(__pezy_sc3__) || defined(__pezy_sc4s__)
+    __builtin_pz_sync_lv(2);
+#else
+    __builtin_pz_sync_lv(1);
+#endif
+}
+
+/* items claimed per atomic operation */
+#define GRAB 4
+
+/* counter[] slot where each thread reports that it finished; see the header. */
+#define PZ_CNT_DONE 16
+
+/* ---------------------------------------------------------------------------
+ * SWAR: eight model positions per 64-bit word.
+ *
+ * The scalar loop cost ~12 instructions per cell, most of it the saturating
+ * clamp and the running max.  Packing eight cells into a 64-bit word brings it
+ * to ~5, and cuts the local-memory traffic from 3 byte accesses per cell to 3
+ * word accesses per eight cells.
+ *
+ * Values are held in "u-space": u = s + 128, so u = 0 is -infinity and the
+ * clamp becomes an unsigned saturating one:
+ *
+ *      u_new = clamp(u - w, 0, 255) = uadd8( usub8(u, wp), wn )
+ *
+ * where wp = max(w,0) and wn = max(-w,0) are the two halves of the signed
+ * score, both in [0,127].  The host builds them as two tables so the kernel
+ * never has to unpack a sign.
+ *
+ * The running maximum is kept capped at 127.  That is what lets the cheap
+ * usub8 (which needs its subtrahend <= 127) serve as the comparison, and it is
+ * safe because the reference discards xE once it reaches 255 - bias_b: in
+ * u-space every value stays <= 126 until the overflow threshold is crossed, so
+ * a capped accumulator is exact below the threshold and still trips it above.
+ * ------------------------------------------------------------------------- */
+
+typedef unsigned long      u64;
+#define H8 0x8080808080808080UL
+#define L8 0x7F7F7F7F7F7F7F7FUL
+
+/* THE 127 INVARIANT
+ * =================
+ * Every DP value is kept in [0,127] by capping it at 127 on the way out of the
+ * recursion.  That is not an approximation:
+ *
+ *   - A value can rise by at most bias_b per step (the largest match score is
+ *     bias_b by construction), so to reach u = 128 a chain must first take a
+ *     value in [128-bias_b, 127] -- and 128-bias_b >= 127-bias_b, which is
+ *     exactly the threshold at which p7_SSVFilter() declares overflow and
+ *     throws the score away.
+ *   - So if the cap ever fires, overflow was already the correct answer, and a
+ *     capped accumulator of 127 makes the host report it.
+ *   - And if overflow does not happen, no value ever reaches 128, the cap never
+ *     fires, and every value is exact.
+ *
+ * Holding the invariant pays for itself twice: the operands of the saturating
+ * subtract have their top bit clear, which removes four operations from it, and
+ * the running maximum compares two values that are both <= 127, which removes
+ * the need to renormalize it.
+ */
+
+/* per-byte r = max(0, a - b).  Requires a <= 127 (the invariant) and b <= 127.
+ *   t = (a|H8) - b  is a + 128 - b per byte, in [1,255]: no borrow can leave a
+ *   byte, and bit 7 of t is set exactly where a >= b. */
+static inline u64 usub8(u64 a, u64 b)
+{
+    u64 t    = (a | H8) - b;
+    u64 m    = t & H8;                       /* bit7 set where a >= b       */
+    u64 keep = (m - (m >> 7)) | m;           /* 0xFF per byte where a >= b  */
+    return (t ^ H8) & keep;                  /* t^H8 is a-b; 0 where a < b  */
+}
+
+/* per-byte r = min(127, x) */
+static inline u64 min127(u64 x)
+{
+    u64 h = x & H8;
+    return (x | (h - (h >> 7))) & L8;
+}
+
+/* per-byte r = max(a,b).  Requires both <= 127. */
+static inline u64 max7(u64 a, u64 b)
+{
+    u64 t    = (a | H8) - b;
+    u64 m    = t & H8;                       /* bit7 set where a >= b */
+    u64 keep = (m - (m >> 7)) | m;
+    return (a & keep) | (b & ~keep);
+}
+
+/* ---------------------------------------------------------------------------
+ * OCCUPANCY: one thread per PE vs eight
+ * ====================================
+ * A PE's 8 threads share its local memory.  The SSV inner loop is
+ * bandwidth-bound on the score table: it reads two rows (2*Mpad bytes) per
+ * residue, and the whole table (2*Kp*Mpad) is re-read once per residue of the
+ * item.  With eight threads per PE working on eight different models, the
+ * per-PE footprint is eight tables and they evict each other from the cache;
+ * with one thread per PE a table of a few KB stays resident, and the DP row
+ * gets all of the local memory instead of an eighth of it.
+ *
+ * So every kernel is compiled twice from the same body:
+ *
+ *   pzc_ssv_*      all 8 threads work; chgthread() in the inner loop hands the
+ *                  PE to a sibling while a global load is outstanding.
+ *   pzc_ssv_*_pe   only tid 0 works, the other seven leave immediately, and
+ *                  chgthread() is dropped -- with no runnable sibling it can
+ *                  only cost issue slots.
+ *
+ * The host picks one by name (HMMER_PEZY_TPP; see p7_pz.c).  Threads that leave
+ * early still tally themselves in counter[PZ_CNT_DONE], so the host's "did
+ * every thread reach the end?" watchdog check needs no change.
+ * ------------------------------------------------------------------------- */
+
+/* Leave the kernel, counting as a completed thread.
+ *
+ * One atomic per PE, not one per thread.  The tally is what tells the host a
+ * launch ran to the end, so every thread of the launch has to be accounted
+ * for -- but one atomic add per thread to a single address serializes, and
+ * that showed up as a fixed cost on the front of every launch.  Thread 0 of
+ * each PE adds the whole PE instead: every path out of every kernel goes
+ * through here, thread 0 included, so the total is still exactly the global
+ * work size, and an incomplete launch still comes up short.
+ */
+#define PZ_QUIT(CNT)                                                    \
+    do {                                                                \
+        if (get_tid() == 0) pz_atomic_add((CNT) + PZ_CNT_DONE, get_maxtid()); \
+        pz_atomic_flush();                                              \
+        flush();                                                        \
+        return;                                                         \
+    } while (0)
+
+/* One residue: sweep the DP row eight model positions at a time.
+ *
+ * Word j holds u for k = 8j+1 .. 8j+8, so the "shift by one k" the recursion
+ * needs is a byte shift with a carry from the previous word.  Every access is
+ * naturally aligned, which a k-indexed formulation would not be.
+ *
+ * Two accumulators are alternated because the running maximum is otherwise a
+ * strictly serial chain through the whole row.
+ *
+ * CHG is chgthread(); in the 8-thread build and empty in the 1-thread build.
+ */
+#define SSV_ROW_BODY(WT, CHG)                                           \
+    {                                                                   \
+        const WT* pw = (const WT*)pr;                                   \
+        const WT* nw = (const WT*)nr;                                   \
+        WT*       sw = (WT*)S;                                          \
+        u64       carry = 0;   /* S[0] = 0, i.e. -infinity, always */     \
+        int       j = 0;                                                \
+        for (; j + 1 < NW; j += 2) {                                    \
+            u64 w0 = sw[j], w1 = sw[j+1];                               \
+            u64 a0 = (w0 << 8) | carry;                                 \
+            u64 a1 = (w1 << 8) | (w0 >> 56);                            \
+            u64 p0 = pw[j],   p1 = pw[j+1];                             \
+            u64 n0 = nw[j],   n1 = nw[j+1];                             \
+            CHG                                                         \
+            carry = w1 >> 56;                                           \
+            u64 r0 = min127(usub8(a0, p0) + n0);                        \
+            u64 r1 = min127(usub8(a1, p1) + n1);                        \
+            sw[j] = r0;  sw[j+1] = r1;                                  \
+            acc0 = max7(acc0, r0);                                      \
+            acc1 = max7(acc1, r1);                                      \
+        }                                                               \
+        for (; j < NW; j++) {                                           \
+            u64 w0 = sw[j];                                             \
+            u64 a0 = (w0 << 8) | carry;                                 \
+            u64 p0 = pw[j], n0 = nw[j];                                 \
+            CHG                                                         \
+            carry = w0 >> 56;                                           \
+            u64 r0 = min127(usub8(a0, p0) + n0);                        \
+            sw[j] = r0;                                                 \
+            acc0  = max7(acc0, r0);                                     \
+        }                                                               \
+    }
+
+/* fold the two accumulators to the raw byte the SSE get_xE() would have
+ * returned.  acc <= 127 always, so acc+128 is exact, and a capped 127 becomes
+ * 255, which the host reads as overflow. */
+#define SSV_FOLD(DST)                                                   \
+    {                                                                   \
+        u64      f = max7(acc0, acc1);                                  \
+        unsigned mx = 0, t;                                             \
+        for (t = 0; t < 8; t++) {                                       \
+            unsigned by = (unsigned)((f >> (8*t)) & 0xFF);              \
+            if (by > mx) mx = by;                                       \
+        }                                                               \
+        (DST) = (unsigned char)(mx + 128);                              \
+    }
+
+/* The body of one work item.  PBASE/NBASE select whether the score tables are
+ * read out of local memory (when they fit) or out of global memory. */
+#define SSV_ITEM_BODY(WT, PBASE, NBASE, CHG)                            \
+    {                                                                   \
+        const unsigned char* q    = dsq + it_qoff[j];                   \
+        const int            a    = it_a[j];                            \
+        const int            b    = it_b[j];                            \
+        int                  warm = a - (M - 1);                        \
+        u64                  acc0 = 0, acc1 = 0;   /* u-space -infinity */ \
+        if (warm < 1) warm = 1;                                         \
+        for (int t = 0; t < NW; t++) ((WT*)S)[t] = 0;                    \
+        for (int i = warm; i <= b; i++) {                               \
+            const unsigned char x = q[i];                               \
+            CHG                                                         \
+            const char* pr = (PBASE) + (int)x * Mpad;                    \
+            const char* nr = (NBASE) + (int)x * Mpad;                    \
+            SSV_ROW_BODY(WT, CHG)                                       \
+        }                                                               \
+        SSV_FOLD(xEpart[j])                                             \
+    }
+
+/* ---------------------------------------------------------------------------
+ * ssv_lmem : score table and DP row both in local memory.
+ *
+ * lmem layout: [ sb table : Kp*Mpad ][ wn table : Kp*Mpad ][ DP rows ]
+ * The host dispatches here only when the tables plus one DP row per working
+ * thread fit in the available lmem.
+ *
+ * ARGUMENTS (both variants; 10 of them -- see the argument-count note at the top)
+ *   sb_g     [2*Kp*Mpad] wp table then wn table
+ *   Kp       alphabet size
+ *   M        model length
+ *   dsq      concatenated digital sequences
+ *   it_qoff  [nitem] dsq offset of item j
+ *   it_a     [nitem] first row of item j
+ *   it_b     [nitem] last row of item j
+ *   nitem    one past the last item of this launch
+ *   xEpart   [nitem] out: per-item xE
+ *   counter  [PZ_CNT_N] atomic work cursor and completion tally
+ * ------------------------------------------------------------------------- */
+#define SSV_LMEM_ARGS                                                   \
+    const char* sb_g, int Kp, int M, const unsigned char* dsq,          \
+    const long* it_qoff, const int* it_a, const int* it_b,              \
+    int nitem, unsigned char* xEpart, int* counter
+
+#define SSV_LMEM_BODY(NTHREAD, CHG)                                     \
+{                                                                       \
+    const int tid  = get_tid();                                         \
+    const int Mpad = (M + 7) & ~7;    /* k = 1..M, padded to a word */  \
+    const int NW   = Mpad / 8;                                          \
+                                                                        \
+    char* const lmem = (char*)get_local_mem_addr();                     \
+    char* const pbl  = lmem;                            /* wp, shared */ \
+    char* const nbl  = lmem + Kp * Mpad;                /* wn, shared */ \
+    char* const S    = lmem + 2 * Kp * Mpad + tid * Mpad;               \
+                                                                        \
+    /* Cooperative load of both score tables: all 8 threads help, even    \
+     * the ones that are about to leave.                                 \
+     *                                                                   \
+     * A word at a time, not a byte at a time.  Every launch pays this    \
+     * copy on every PE before it can start, so at one byte per           \
+     * iteration it was a fixed ~12 ms on the front of every launch --    \
+     * more than the DP itself for a short model.  Mpad is a multiple of  \
+     * 8 and both ends are buffer-aligned, so the u64 form is safe.       \
+     */                                                                  \
+    {                                                                   \
+        u64* const       dstw = (u64*)pbl;                              \
+        const u64* const srcw = (const u64*)sb_g;                       \
+        const int        nw   = (2 * Kp * Mpad) >> 3;                    \
+        for (int t = tid; t < nw; t += get_maxtid()) {                    \
+            dstw[t] = srcw[t];                                          \
+            chgthread();                                                \
+        }                                                               \
+    }                                                                   \
+    sync_pe();          /* the table must be whole before anyone uses it */ \
+    pz_atomic_flush();  /* see the host's zeroing of <counter> */           \
+                                                                        \
+    if ((NTHREAD) == 1 && tid != 0) PZ_QUIT(counter);                   \
+                                                                        \
+    for (;;)                                                            \
+    {                                                                   \
+        int base = pz_atomic_add(counter, GRAB);  /* the OLD value */    \
+        if (base >= nitem) break;                                       \
+        int last = base + GRAB; if (last > nitem) last = nitem;          \
+        for (int j = base; j < last; j++) SSV_ITEM_BODY(u64, pbl, nbl, CHG) \
+    }                                                                   \
+                                                                        \
+    PZ_QUIT(counter);                                                   \
+}
+
+void pzc_ssv_lmem   (SSV_LMEM_ARGS) SSV_LMEM_BODY(8, chgthread();)
+void pzc_ssv_lmem_pe(SSV_LMEM_ARGS) SSV_LMEM_BODY(1,)
+
+/* ---------------------------------------------------------------------------
+ * ssv_gmem : DP row in local memory, score table left in global memory.
+ * Used when the tables do not fit in lmem but the DP rows do.
+ * Arguments are identical to ssv_lmem.
+ * ------------------------------------------------------------------------- */
+#define SSV_GMEM_BODY(NTHREAD, CHG)                                     \
+{                                                                       \
+    const int tid  = get_tid();                                         \
+    const int Mpad = (M + 7) & ~7;                                      \
+    const int NW   = Mpad / 8;                                          \
+                                                                        \
+    char* const S = (char*)get_local_mem_addr() + tid * Mpad;           \
+                                                                        \
+    pz_atomic_flush();                                                  \
+                                                                        \
+    if ((NTHREAD) == 1 && tid != 0) PZ_QUIT(counter);                   \
+                                                                        \
+    for (;;)                                                            \
+    {                                                                   \
+        int base = pz_atomic_add(counter, GRAB);                        \
+        if (base >= nitem) break;                                       \
+        int last = base + GRAB; if (last > nitem) last = nitem;          \
+        for (int j = base; j < last; j++)                               \
+            SSV_ITEM_BODY(u64, sb_g, sb_g + Kp * Mpad, CHG)             \
+    }                                                                   \
+                                                                        \
+    PZ_QUIT(counter);                                                   \
+}
+
+void pzc_ssv_gmem   (SSV_LMEM_ARGS) SSV_GMEM_BODY(8, chgthread();)
+void pzc_ssv_gmem_pe(SSV_LMEM_ARGS) SSV_GMEM_BODY(1,)
+
+/* ---------------------------------------------------------------------------
+ * ssv_multi : many models x many query sequences, one launch.
+ *
+ * This is hmmscan's shape: one short query against a whole profile database.
+ * Both score tables stay in global memory -- for a pressed Pfam-A they total
+ * 0.26 GB -- and only the DP row is per-thread in local memory, at a fixed
+ * <rowstride> so a thread can take an item for any model.  The host keeps
+ * models whose padded length exceeds the stride on the CPU; in Pfam-A that is
+ * 2 models out of 30,134.
+ *
+ * Work item j addresses (model, query) implicitly as j/npq and j%npq, which
+ * avoids uploading an item list -- for 30,134 models against 50 queries an
+ * explicit list would be 48 MB, versus 0.4 MB for the two descriptor arrays.
+ * Long queries are pre-split by the host into overlapping pseudo-queries, so
+ * one item is always one bounded piece of work.
+ *
+ * ARGUMENTS
+ *   mdl        mdl[2*m+0] = byte offset of model m's wp table (wn follows at
+ *              + Kp*Mpad); mdl[2*m+1] = M
+ *   pq         pq[2*p+0] = offset of pseudo-query p in <dsq>; pq[2*p+1] = its
+ *              length
+ *   npq        number of pseudo-queries
+ *   Kp         alphabet size
+ *   rowstride  lmem bytes reserved per working thread's DP row
+ *   tab        all models' score tables
+ *   dsq        concatenated digital queries
+ *   nitem      one past the last item of this launch
+ *   xEout      [nitem] out
+ *   counter    [PZ_CNT_N] atomic work cursor and completion tally
+ * ------------------------------------------------------------------------- */
+#define SSV_MULTI_ARGS                                                  \
+    const long* mdl, const long* pq, int npq, int Kp, int rowstride,    \
+    const char* tab, const unsigned char* dsq,                          \
+    int nitem, unsigned char* xEout, int* counter
+
+#define SSV_MULTI_BODY(NTHREAD, CHG)                                    \
+{                                                                       \
+    const int tid = get_tid();                                          \
+    char* const S = (char*)get_local_mem_addr() + tid * rowstride;      \
+                                                                        \
+    pz_atomic_flush();   /* see the host's zeroing of <counter> */       \
+                                                                        \
+    if ((NTHREAD) == 1 && tid != 0) PZ_QUIT(counter);                   \
+                                                                        \
+    for (;;)                                                            \
+    {                                                                   \
+        int base = pz_atomic_add(counter, GRAB);  /* the OLD value */    \
+        if (base >= nitem) break;                                       \
+        int last = base + GRAB; if (last > nitem) last = nitem;          \
+                                                                        \
+        for (int j = base; j < last; j++)                               \
+        {                                                               \
+            const int   m    = j / npq;                                 \
+            const int   p    = j - m * npq;                             \
+            const long  toff = mdl[2*m];                                \
+            const int   M    = (int) mdl[2*m + 1];                      \
+            const int   Mpad = (M + 7) & ~7;                            \
+            const int   NW   = Mpad / 8;                                \
+            const unsigned char* q = dsq + pq[2*p];                     \
+            const int   L    = (int) pq[2*p + 1];                       \
+            const char* const pbase = tab + toff;                       \
+            const char* const nbase = pbase + Kp * Mpad;                \
+            u64 acc0 = 0, acc1 = 0;                                     \
+                                                                        \
+            for (int t = 0; t < NW; t++) ((u64*)S)[t] = 0;               \
+                                                                        \
+            for (int i = 1; i <= L; i++)                                \
+            {                                                           \
+                const unsigned char x = q[i];                           \
+                CHG                                                     \
+                const char* pr = pbase + (int)x * Mpad;                 \
+                const char* nr = nbase + (int)x * Mpad;                 \
+                SSV_ROW_BODY(u64, CHG)                                  \
+            }                                                           \
+                                                                        \
+            SSV_FOLD(xEout[j])                                          \
+        }                                                               \
+    }                                                                   \
+                                                                        \
+    PZ_QUIT(counter);                                                   \
+}
+
+void pzc_ssv_multi   (SSV_MULTI_ARGS) SSV_MULTI_BODY(8, chgthread();)
+void pzc_ssv_multi_pe(SSV_MULTI_ARGS) SSV_MULTI_BODY(1,)
+
+/* ---------------------------------------------------------------------------
+ * ssv_multi_share : one model per PE, its score table in local memory.
+ *
+ * ssv_multi_pe leaves seven of a PE's eight threads idle because eight threads
+ * on eight different models thrash the cache.  The fix is not to
+ * give up the threads but to put them all on the SAME model: then there is one
+ * score table per PE instead of eight, it is small enough to copy into local
+ * memory, and the inner loop stops touching global memory altogether -- while
+ * eight threads still hide what latency is left.
+ *
+ * Work is therefore claimed per PE, not per thread: thread 0 takes GRAB_PE
+ * consecutive items, publishes the cursor through local memory, and the eight
+ * threads then walk the block in groups of eight.  Items are (model, query) as
+ * j/npq and j%npq, so eight consecutive items are eight queries of one model
+ * whenever the group does not straddle a model boundary -- which is why the
+ * host only dispatches here when npq >= 8.
+ *
+ * lmem layout (offsets from get_local_mem_addr(); Mpad is the current group's):
+ *      0              8 DP rows of Mpad bytes, thread tid at tid*Mpad
+ *      8*Mpad         the group's score table, 2*Kp*Mpad bytes, when it fits
+ *      PZ_LMEM_BCAST  the PE's work cursor, published by thread 0
+ *
+ * A group that straddles a model boundary (or the end of the launch) falls
+ * back to per-thread models with the table left in global memory; its rows go
+ * at tid*rowstride, which cannot collide because rowstride is the largest Mpad
+ * on the device.  Arguments are ssv_multi's, unchanged.
+ * ------------------------------------------------------------------------- */
+
+/* Local memory available to us: what the PE's local memory leaves after the
+ * host's 1 KB per-thread stacks (P7_PZ_STACKSIZE / P7_PZ_LMEM_AVAIL in p7_pz.c
+ * -- keep in sync).
+ * The last 64 bytes are the broadcast slot, so the host caps rowstride at
+ * PZ_LMEM_WORK/8. */
+#define PZ_LMEM_TOTAL  16384
+#define PZ_LMEM_BCAST  (PZ_LMEM_TOTAL - 64)
+#define PZ_LMEM_WORK   PZ_LMEM_BCAST
+
+/* items one PE claims per atomic operation (GRAB per thread) */
+#define GRAB_PE  (8 * GRAB)
+
+void
+pzc_ssv_multi_share(SSV_MULTI_ARGS)
+{
+    const int   tid   = get_tid();
+    char* const lmem  = (char*)get_local_mem_addr();
+    int*  const bcast = (int*)(lmem + PZ_LMEM_BCAST);
+    int         held  = -1;   /* model whose table is currently in lmem, or -1 */
+
+    pz_atomic_flush();   /* see the host's zeroing of <counter> */
+
+    for (;;)
+    {
+        int base;
+
+        if (tid == 0) bcast[0] = pz_atomic_add(counter, GRAB_PE);
+        sync_pe();
+        base = bcast[0];
+        if (base >= nitem) break;
+
+        for (int g = 0; g < GRAB_PE; g += 8)
+        {
+            const int   j0 = base + g;      /* first item of this group of 8 */
+            const int   j  = j0 + tid;      /* this thread's item           */
+            int         m = 0, Mpad = 0, NW = 0;
+            const char* pbase = 0;
+            char*       S     = 0;
+
+            if (j0 >= nitem) break;         /* uniform across the PE */
+
+            if (j0 + 7 < nitem && (j0 + 7) / npq == j0 / npq)
+            {
+                /* the whole group is one model: share its table */
+                m     = j0 / npq;
+                Mpad  = ((int) mdl[2*m + 1] + 7) & ~7;
+                NW    = Mpad / 8;
+                S     = lmem + tid * Mpad;
+                pbase = tab + mdl[2*m];
+
+                if (8 * Mpad + 2 * Kp * Mpad <= PZ_LMEM_WORK)
+                {
+                    u64* const dst = (u64*)(lmem + 8 * Mpad);
+
+                    /* A PE claims GRAB_PE consecutive items, so several groups
+                     * in a row are usually the same model: only copy when the
+                     * table in lmem is not already the one we want. */
+                    if (m != held)
+                    {
+                        const u64* src = (const u64*)pbase;
+                        const int  nw  = (2 * Kp * Mpad) >> 3;
+                        for (int t = tid; t < nw; t += get_maxtid()) {
+                            dst[t] = src[t];
+                            chgthread();
+                        }
+                        sync_pe();          /* table whole before anyone reads it */
+                        held = m;
+                    }
+                    pbase = (const char*)dst;
+                }
+                else held = -1;             /* lmem table area left untouched */
+            }
+            else if (j < nitem)
+            {
+                /* straddles a model boundary: per-thread model, global table.
+                 * Rows go at tid*rowstride, which can run over the lmem table
+                 * area, so whatever was held there is gone. */
+                m     = j / npq;
+                Mpad  = ((int) mdl[2*m + 1] + 7) & ~7;
+                NW    = Mpad / 8;
+                S     = lmem + tid * rowstride;
+                pbase = tab + mdl[2*m];
+                held  = -1;
+            }
+            else held = -1;
+
+            if (NW > 0)
+            {
+                const int   p  = j - m * npq;
+                const unsigned char* q = dsq + pq[2*p];
+                const int   L  = (int) pq[2*p + 1];
+                const char* const nbase = pbase + Kp * Mpad;
+                u64 acc0 = 0, acc1 = 0;
+
+                for (int t = 0; t < NW; t++) ((u64*)S)[t] = 0;
+
+                for (int i = 1; i <= L; i++)
+                {
+                    const unsigned char x = q[i];
+                    chgthread();
+                    const char* pr = pbase + (int)x * Mpad;
+                    const char* nr = nbase + (int)x * Mpad;
+                    SSV_ROW_BODY(u64, chgthread();)
+                }
+
+                SSV_FOLD(xEout[j])
+            }
+
+            sync_pe();   /* nobody may reload the shared table while it is in use */
+        }
+    }
+
+    PZ_QUIT(counter);
+}
+
+/*****************************************************************
+ * 5. Floating-point conformance probe
+ *
+ * Not part of the pipeline.  This kernel exists to answer one question:
+ * for the operations impl_sse/fwdback.c performs, does the SC3 float unit
+ * produce the same bits as x86 SSE?  If it does, Forward/Backward can be
+ * parallelized per call -- one target sequence per thread, no reassociation --
+ * without changing HMMER's output.  See p7_pz_fpprobe.h for why each op is
+ * here, and p7_pz_FPProbe() for the host side.
+ *
+ * Every op is computed for every input triple; the switch is in which output
+ * slice it lands in, so one launch measures all of them on identical inputs.
+ *****************************************************************/
+
+#include "p7_pz_fpprobe.h"
+
+void
+pzc_fpprobe(float *out, const float *in, int n, int *counter)
+{
+    const int gid = get_pid() * get_maxtid() + get_tid();
+    const int st  = get_maxpid() * get_maxtid();
+    const float *A = in;
+    const float *B = in + n;
+    const float *C = in + 2 * n;
+    int i;
+
+    pz_atomic_flush();
+
+    for (i = gid; i < n; i += st)
+    {
+        const float a = A[i], b = B[i], c = C[i];
+        float r;
+
+        out[P7_PZ_FP_ADD * n + i] = a + b;
+        out[P7_PZ_FP_SUB * n + i] = a - b;
+        out[P7_PZ_FP_MUL * n + i] = a * b;
+        out[P7_PZ_FP_DIV * n + i] = a / b;
+
+        /* The two halves of the FMA question, pinned down explicitly rather
+         * than left to whatever the compiler defaults to. */
+        {
+#pragma clang fp contract(off)
+            out[P7_PZ_FP_MADD_OFF * n + i] = a * b + c;
+        }
+        {
+#pragma clang fp contract(fast)
+            out[P7_PZ_FP_MADD_FAST * n + i] = a * b + c;
+        }
+        {
+#pragma clang fp contract(on)
+            out[P7_PZ_FP_MADD_ON * n + i] = a * b + c;
+        }
+        /* The PZSDK's own two spellings, mad() and fma().  Comparing both
+         * against the host tells us whether a true fused multiply-add exists
+         * at all, which is what makes the contract(off) result meaningful. */
+        out[P7_PZ_FP_MAD_CALL * n + i] = mad(a, b, c);
+        out[P7_PZ_FP_FMA_CALL * n + i] = fma(a, b, c);
+
+        /* fwdback.c:424 vs. the naive transcription of it */
+        out[P7_PZ_FP_RECIP_D * n + i] = (float) (1.0 / (double) a);
+        out[P7_PZ_FP_RECIP_F * n + i] = 1.0f / a;
+
+        /* forward_engine's inner loop for one lane: four multiply-accumulates
+         * into sv, then the emission multiply.  Same operand order as
+         * fwdback.c:312-316. */
+        {
+#pragma clang fp contract(off)
+            r  = a * b;
+            r += b * c;
+            r += c * a;
+            r += a * a;
+            r  = r * b;
+            out[P7_PZ_FP_FWDSTEP * n + i] = r;
+        }
+
+        out[P7_PZ_FP_DMADD * n + i] = (float) ((double) a * (double) b + (double) c);
+        out[P7_PZ_FP_LOGF  * n + i] = log(a);
+        out[P7_PZ_FP_LOGD  * n + i] = (float) log((double) a);
+
+        /* Does a one-ulp difference stay one ulp, or does it grow?  Answers
+         * "even if the ops differ slightly, could we live with it?" */
+        {
+#pragma clang fp contract(off)
+            int j;
+            r = a;
+            for (j = 0; j < 64; j++) r = r * b + c;
+            out[P7_PZ_FP_CHAIN64 * n + i] = r;
+        }
+    }
+
+    PZ_QUIT(counter);
+}
+
+/*****************************************************************
+ * 6. Parser-mode Forward
+ *
+ * A transcription of impl_sse/fwdback.c's forward_engine(do_full=FALSE), one
+ * target sequence per thread.  See p7_pz_fbparse.h for what crosses PCIe and
+ * why the result is bit-exact.
+ *
+ * WHAT MUST BE COPIED EXACTLY, NOT JUST EQUIVALENTLY
+ * =================================================
+ * Float addition is not associative, so every place the reference fixes an
+ * order has to be reproduced, not merely computed:
+ *
+ *   - the four-term sv accumulation is left-to-right (B, M, I, D), each with
+ *     its own rounding.  No FMA: contract(off) is pinned below, and the
+ *     conformance probe confirmed the compiler does not fuse anyway.
+ *   - the xEv horizontal sum is _mm_shuffle-based, i.e. (a0+a1) + (a2+a3),
+ *     NOT a0+a1+a2+a3 left to right.  fwd_hsum() below does the former.
+ *   - the rescale reciprocal is `_mm_set1_ps(1.0 / xE)`, where 1.0 is a
+ *     *double*: one double divide then one narrowing.  But xN/xE, xC/xE,
+ *     xJ/xE and xB/xE right above it are *float* divides.  Writing 1.0f/xE
+ *     for the first, or the double form for the others, changes low bits.
+ *   - the DD loop's early exit uses _mm_cmpgt_ps / _mm_movemask_ps, so it
+ *     triggers on a strict increase in ANY of the four lanes.  How many DD
+ *     passes run changes the values, so the predicate must match.
+ *   - `om->M < 100` selects full serialization instead.  M, not Q.
+ *
+ * Lanes are held as four scalars because the only cross-lane operations are
+ * the shift-on-zero and that horizontal sum; per-lane scalar arithmetic is
+ * bit-identical to _mm_mul_ps / _mm_add_ps on each lane.
+ *
+ * MEMORY
+ * ======
+ * The DP row (P7_PZ_NSCELLS * Q float4 = 48*Q bytes) is in local memory; at
+ * the 16 KB we get with a 1 KB per-thread stack that is Q <= 341, i.e.
+ * M <= 1364, which covers every model in Pfam-A but the outliers.  tfv (128*Q
+ * bytes) and rfv (16*Kp*Q) stay in global memory: they are shared by every
+ * thread, so they stay cache-resident (at M=420 the pair is 62 KB).  The host
+ * checks the fit and falls back for anything larger.
+ *
+ * ARGUMENTS (10 -- see the argument-count note in the file header)
+ *   tfv      [8*Q*4]        transition probabilities, om->tfv de-vectorized
+ *   rfv      [Kp*Q*4]       emission probabilities, om->rfv de-vectorized
+ *   it_xf    [nitem*P7_PZ_XF_N]  per-item special-state transitions
+ *   dsq      concatenated digital sequences, sentinels included
+ *   it_off   [3*nitem]      [j] = dsq offset of item j, [nitem+j] = its
+ *                            Forward xmx offset, [2*nitem+j] = its Backward
+ *                            one.  Three sections in one array so the kernel
+ *                            stays at ten arguments (see the file header)
+ *   it_len   [nitem]        L of item j
+ *   M        model length (Q is derived; the <100 branch needs M itself)
+ *   nitem    one past the last item of this launch
+ *   xmx_out  out: (L+1)*P7_PZ_NXCELLS floats per item per direction
+ *   counter  atomic work cursor and completion tally (see the file header)
+ *****************************************************************/
+
+#include "p7_pz_fbparse.h"
+
+/* (a0+a1) + (a2+a3) -- the order _mm_shuffle_ps/_mm_add_ps produces in
+ * fwdback.c's horizontal sum of xEv. */
+static inline float fwd_hsum(float4 v)
+{
+#pragma clang fp contract(off)
+    return (v.x + v.y) + (v.z + v.w);
+}
+
+/* esl_sse_rightshiftz_float(): [a0 a1 a2 a3] -> [0 a0 a1 a2] */
+static inline float4 fwd_rshiftz(float4 v)
+{
+    return (float4){ 0.0f, v.x, v.y, v.z };
+}
+
+#define FWDP_ARGS                                                       \
+    const float* tfv, const float* rfv, const float* it_xf,             \
+    const unsigned char* dsq, const long* it_off, const int* it_len,    \
+    int M, int nitem, float* xmx_out, int* counter
+
+/* One item: sequence <j> of the batch.
+ *
+ * Written on float4, which is what the reference is: every operation here is
+ * the elementwise counterpart of an _mm_*_ps, so each lane rounds exactly as
+ * it does on x86 and no cross-lane reassociation happens.  The two places the
+ * reference crosses lanes -- the shift-on-zero and the horizontal sum -- are
+ * the two helpers above.
+ *
+ * A scalar-per-lane version of this loop ran at 8.72 Gcells/s: spelling the
+ * four lanes out one at a time was much slower than letting the compiler
+ * handle the float4 as a whole.
+ */
+/* The declarations Forward and Backward share.  They have to live in the
+ * enclosing block, not inside either half, or the second half cannot see
+ * them. */
+#define FBP_PROLOGUE                                                    \
+    /* Belt and braces: the Makefile also passes -ffp-contract=off.  A   \
+     * fused multiply-add here would round once where fwdback.c rounds   \
+     * twice, and the conformance probe showed that changes 2-27% of     \
+     * results. */                                                      \
+    _Pragma("clang fp contract(off)")                                   \
+    const int    L    = it_len[j];                                      \
+    const unsigned char* sq = dsq + it_off[j];                          \
+    float* const fxmx = xmx_out + it_off[nitem + j];                    \
+    float* const bxmx = xmx_out + it_off[2 * nitem + j];                \
+    const float* xf   = it_xf + (long)j * P7_PZ_XF_N;                   \
+    float4* const       rw  = (float4*)row;      /* [q*3 + {M,D,I}] */   \
+    const float4* const tv  = (const float4*)tfv;                       \
+    const float4* const rv  = (const float4*)rfv;                       \
+    const float4* const tdd = tv + 7 * Q;        /* the DD quads */      \
+    const float4        zero = (float4){ 0.0f, 0.0f, 0.0f, 0.0f };       \
+                                                                        \
+    const float xf_nmove = xf[P7_PZ_XF_NMOVE];                          \
+    const float xf_nloop = xf[P7_PZ_XF_NLOOP];                          \
+    const float xf_cloop = xf[P7_PZ_XF_CLOOP];                          \
+    const float xf_emove = xf[P7_PZ_XF_EMOVE];                          \
+    const float xf_eloop = xf[P7_PZ_XF_ELOOP];                          \
+    const float xf_jloop = xf[P7_PZ_XF_JLOOP];                          \
+    const float xf_jmove = xf[P7_PZ_XF_JMOVE];                          \
+    const float xf_cmove = xf[P7_PZ_XF_CMOVE];
+
+#define FWDP_ITEM_BODY(CHG)                                             \
+{                                                                       \
+    _Pragma("clang fp contract(off)")                                   \
+    float xN, xE, xB, xC, xJ;                                           \
+    int   i, q;                                                         \
+                                                                        \
+    /* Initialization: row 0 is all zeros; specials as fwdback.c:301-311 */ \
+    for (q = 0; q < 3 * Q; q++) rw[q] = zero;                           \
+    xE = 0.0f;  xN = 1.0f;  xJ = 0.0f;  xB = xf_nmove;  xC = 0.0f;      \
+    fxmx[P7_PZ_XC_E] = 0.0f;                                             \
+    fxmx[P7_PZ_XC_N] = 1.0f;                                             \
+    fxmx[P7_PZ_XC_J] = 0.0f;                                             \
+    fxmx[P7_PZ_XC_B] = xB;                                               \
+    fxmx[P7_PZ_XC_C] = 0.0f;                                             \
+    fxmx[P7_PZ_XC_SCALE] = 1.0f;                                         \
+                                                                        \
+    for (i = 1; i <= L; i++)                                            \
+    {                                                                   \
+        const float4* rp = rv + (long)sq[i] * Q;                        \
+        const float4* tp = tv;                                          \
+        float4 dcv = zero, xEv = zero, mpv, dpv, ipv, sv;               \
+        const float4 xBv = (float4){ xB, xB, xB, xB };                  \
+                                                                        \
+        mpv = fwd_rshiftz(rw[(Q-1)*P7_PZ_NSCELLS + P7_PZ_SC_M]);        \
+        dpv = fwd_rshiftz(rw[(Q-1)*P7_PZ_NSCELLS + P7_PZ_SC_D]);        \
+        ipv = fwd_rshiftz(rw[(Q-1)*P7_PZ_NSCELLS + P7_PZ_SC_I]);        \
+                                                                        \
+        for (q = 0; q < Q; q++)                                         \
+        {                                                               \
+            float4* const cell = rw + q * P7_PZ_NSCELLS;                \
+            /* Issue this iteration's global loads, THEN switch threads, \
+             * then compute, so the loads overlap a sibling's work.  tfv  \
+             * and rfv stay in global memory: they are shared by every    \
+             * thread and do not fit in lmem beside the DP row. */       \
+            const float4 t0 = tp[0], t1 = tp[1], t2 = tp[2], t3 = tp[3]; \
+            const float4 t4 = tp[4], t5 = tp[5], t6 = tp[6], r = rp[q];  \
+            CHG                                                         \
+                                                                        \
+            /* fwdback.c:310-316, in that order, no fusion */           \
+            sv   = xBv * t0;                                            \
+            sv  += mpv * t1;                                            \
+            sv  += ipv * t2;                                            \
+            sv  += dpv * t3;                                            \
+            sv   = sv * r;                                              \
+            xEv += sv;                                                  \
+                                                                        \
+            /* load {MDI}(i-1,q) before the delayed stores clobber it */ \
+            mpv = cell[P7_PZ_SC_M];                                     \
+            dpv = cell[P7_PZ_SC_D];                                     \
+            ipv = cell[P7_PZ_SC_I];                                     \
+            cell[P7_PZ_SC_M] = sv;                                      \
+            cell[P7_PZ_SC_D] = dcv;                                     \
+                                                                        \
+            dcv = sv * t4;                                              \
+            { const float4 mt = mpv * t5;                               \
+              cell[P7_PZ_SC_I] = mt + ipv * t6; }                       \
+                                                                        \
+            tp += 7;                                                    \
+        }                                                               \
+                                                                        \
+        /* --- DD paths.  fwdback.c:369-418 --- */                      \
+        {                                                               \
+            float4 carry = fwd_rshiftz(dcv);                            \
+            int    j2;                                                  \
+                                                                        \
+            rw[P7_PZ_SC_D] = zero;         /* DMO(dpc,0) = zerov */      \
+            for (q = 0; q < Q; q++) {                                   \
+                float4* const d = rw + q * P7_PZ_NSCELLS + P7_PZ_SC_D;  \
+                *d    = carry + *d;                                     \
+                carry = *d * tdd[q];       /* extend DMO(q) */          \
+            }                                                           \
+                                                                        \
+            if (M < 100) {                 /* fully serialized */        \
+                for (j2 = 1; j2 < 4; j2++) {                            \
+                    carry = fwd_rshiftz(carry);                         \
+                    for (q = 0; q < Q; q++) {                           \
+                        float4* const d = rw + q * P7_PZ_NSCELLS + P7_PZ_SC_D; \
+                        *d    = carry + *d;                             \
+                        carry = carry * tdd[q];  /* extend carry, not D */ \
+                    }                                                   \
+                    CHG                                                 \
+                }                                                       \
+            } else {                                                    \
+                for (j2 = 1; j2 < 4; j2++) {                            \
+                    int4 cv = (int4){ 0, 0, 0, 0 };                     \
+                    carry   = fwd_rshiftz(carry);                       \
+                    for (q = 0; q < Q; q++) {                           \
+                        float4* const d = rw + q * P7_PZ_NSCELLS + P7_PZ_SC_D; \
+                        const float4 s2 = carry + *d;                   \
+                        cv   |= (s2 > *d);   /* _mm_cmpgt_ps */         \
+                        *d    = s2;                                     \
+                        carry = carry * tdd[q];                         \
+                    }                                                   \
+                    CHG                                                 \
+                    /* _mm_movemask_ps(cv): did any lane increase? */   \
+                    if (! (cv.x | cv.y | cv.z | cv.w)) break;           \
+                }                                                       \
+            }                                                           \
+        }                                                               \
+                                                                        \
+        /* D's into xEv, then the fixed-order horizontal sum */          \
+        for (q = 0; q < Q; q++)                                         \
+            xEv = rw[q * P7_PZ_NSCELLS + P7_PZ_SC_D] + xEv;             \
+        xE = fwd_hsum(xEv);                                             \
+                                                                        \
+        xN =  xN * xf_nloop;                                            \
+        xC = (xC * xf_cloop) + (xE * xf_emove);                         \
+        xJ = (xJ * xf_jloop) + (xE * xf_eloop);                         \
+        xB = (xJ * xf_jmove) + (xN * xf_nmove);                         \
+                                                                        \
+        /* 1.0e4 is exact in float and in double, so the reference's      \
+         * double comparison and this float one agree. */               \
+        if (xE > 1.0e4f) {                                              \
+            /* float divides ... */                                     \
+            xN = xN / xE;                                               \
+            xC = xC / xE;                                               \
+            xJ = xJ / xE;                                               \
+            xB = xB / xE;                                               \
+            /* ... but _mm_set1_ps(1.0 / xE) divides in double */       \
+            {                                                           \
+                const float  sinv = (float) (1.0 / (double) xE);        \
+                const float4 inv  = (float4){ sinv, sinv, sinv, sinv }; \
+                for (q = 0; q < 3 * Q; q++) rw[q] = rw[q] * inv;        \
+            }                                                           \
+            fxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_SCALE] = xE;               \
+            /* totscale += log(xE) is the host's job, so that it uses   \
+             * the same log() as the reference. */                      \
+            xE = 1.0f;                                                  \
+        } else                                                          \
+            fxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_SCALE] = 1.0f;             \
+                                                                        \
+        fxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_E] = xE;                       \
+        fxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_N] = xN;                       \
+        fxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_J] = xJ;                       \
+        fxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_B] = xB;                       \
+        fxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_C] = xC;                       \
+    }                                                                   \
+}
+
+
+/* esl_sse_leftshiftz_float(): [a0 a1 a2 a3] -> [a1 a2 a3 0]
+ * (the reference spells it _mm_move_ss(v,zero) then shuffle(0,3,2,1)). */
+static inline float4 fwd_lshiftz(float4 v)
+{
+    return (float4){ v.y, v.z, v.w, 0.0f };
+}
+
+/* One item's Backward, run straight after its Forward and in the same kernel.
+ *
+ * Fusing the two is what makes Backward nearly free to add: backward_engine()
+ * needs the Forward matrix ONLY for its scale factors
+ * (fwdback.c: `fwd->xmx[i*p7X_NXCELLS+p7X_SCALE]`), and those are sitting in
+ * global memory where this item's Forward just wrote them.  Nothing has to be
+ * uploaded, and the DP row in local memory is reused as-is: Backward starts
+ * from scratch at row L.
+ *
+ * <bxmx> is this item's Backward xmx block; <fxmx> its Forward one, read only.
+ *
+ * has_own_scales is NOT returned.  The host derives it by comparing the two
+ * scale columns: the flag only ever makes backward_engine() write a scale that
+ * differs from fwd's, and where they agree the flag changes nothing downstream
+ * (p7_DomainDecoding's correction multiplies by fwd/bck, which is then exactly
+ * 1.0).  Same for totscale, which is a sum of logs and so stays on the host.
+ */
+#define BCKP_ITEM_BODY(CHG)                                             \
+{                                                                       \
+    _Pragma("clang fp contract(off)")                                   \
+    const float4* const tdd = tv + 7 * Q;                               \
+    float  xN, xE, xB, xC, xJ, s;                                       \
+    int    i, q, j2, own = 0;                                           \
+                                                                        \
+    /* ---- the L row.  fwdback.c:509-579 ---- */                       \
+    xJ = 0.0f;  xB = 0.0f;  xN = 0.0f;                                  \
+    xC = xf_cmove;                                                      \
+    xE = xC * xf_emove;                                                 \
+    { const float4 xEv = (float4){ xE, xE, xE, xE };                    \
+      for (q = 0; q < Q; q++) {                                         \
+          rw[q*P7_PZ_NSCELLS + P7_PZ_SC_M] = xEv;                       \
+          rw[q*P7_PZ_NSCELLS + P7_PZ_SC_D] = xEv;                       \
+          rw[q*P7_PZ_NSCELLS + P7_PZ_SC_I] = zero;                      \
+      } }                                                               \
+                                                                        \
+    /* row L, DD init: first pass includes xE via D(q) */               \
+    { float4 dpv = fwd_lshiftz(rw[(Q-1)*P7_PZ_NSCELLS + P7_PZ_SC_D]);   \
+      float4 dcv = zero;                                                \
+      for (q = Q-1; q >= 0; q--) {                                      \
+          float4* const d = rw + q*P7_PZ_NSCELLS + P7_PZ_SC_D;          \
+          dcv = dpv * tdd[q];                                           \
+          *d  = *d + dcv;                                               \
+          dpv = *d;                                                     \
+      }                                                                 \
+      /* three more passes, extending dcv only */                       \
+      for (j2 = 1; j2 < 4; j2++) {                                      \
+          dcv = fwd_lshiftz(dcv);                                       \
+          for (q = Q-1; q >= 0; q--) {                                  \
+              float4* const d = rw + q*P7_PZ_NSCELLS + P7_PZ_SC_D;      \
+              dcv = dcv * tdd[q];                                       \
+              *d  = *d + dcv;                                           \
+          }                                                             \
+          CHG                                                          \
+      }                                                                 \
+      /* MD init */                                                     \
+      dcv = fwd_lshiftz(rw[P7_PZ_SC_D]);                                \
+      for (q = Q-1; q >= 0; q--) {                                      \
+          float4* const m = rw + q*P7_PZ_NSCELLS + P7_PZ_SC_M;          \
+          *m  = *m + dcv * tv[q*7 + 4];        /* Mk->Dk+1 */           \
+          dcv = rw[q*P7_PZ_NSCELLS + P7_PZ_SC_D];                       \
+      } }                                                               \
+                                                                        \
+    /* row L rescale: the same factor Forward used */                   \
+    s = fxmx[L * P7_PZ_NXCELLS + P7_PZ_XC_SCALE];                       \
+    if (s > 1.0f) {                                                     \
+        xE = xE / s;  xN = xN / s;  xC = xC / s;  xJ = xJ / s;  xB = xB / s; \
+        { const float  si  = (float) (1.0 / (double) s);                 \
+          const float4 inv = (float4){ si, si, si, si };                 \
+          for (q = 0; q < 3 * Q; q++) rw[q] = rw[q] * inv; }             \
+    }                                                                   \
+    bxmx[L * P7_PZ_NXCELLS + P7_PZ_XC_SCALE] = s;                       \
+    bxmx[L * P7_PZ_NXCELLS + P7_PZ_XC_E]     = xE;                      \
+    bxmx[L * P7_PZ_NXCELLS + P7_PZ_XC_N]     = xN;                      \
+    bxmx[L * P7_PZ_NXCELLS + P7_PZ_XC_J]     = xJ;                      \
+    bxmx[L * P7_PZ_NXCELLS + P7_PZ_XC_B]     = xB;                      \
+    bxmx[L * P7_PZ_NXCELLS + P7_PZ_XC_C]     = xC;                      \
+                                                                        \
+    /* ---- main recursion, i = L-1 .. 1.  fwdback.c:585-712 ---- */    \
+    for (i = L-1; i >= 1; i--)                                          \
+    {                                                                   \
+        const float4* rp = rv + (long)sq[i+1] * Q;                      \
+        float4 tmmv, timv, tdmv, mpv, mcv, dcv, dpv, xBv;               \
+                                                                        \
+        /* phase 1: I(i,k) complete, {MD}(i,k) partial, xB collected */ \
+        tmmv = fwd_lshiftz(tv[1]);   /* q=0's MM, IM, DM, wrapped */     \
+        timv = fwd_lshiftz(tv[2]);                                      \
+        tdmv = fwd_lshiftz(tv[3]);                                      \
+        mpv  = fwd_lshiftz(rw[P7_PZ_SC_M] * rp[0]);                     \
+        xBv  = zero;                                                    \
+        for (q = Q-1; q >= 0; q--) {                                    \
+            float4* const cell = rw + q * P7_PZ_NSCELLS;                \
+            const float4  ipv  = cell[P7_PZ_SC_I];                      \
+            const float4  t    = tv[q*7 + 6];    /* II */               \
+            const float4  tmi  = tv[q*7 + 5];    /* MI */               \
+            CHG                                                        \
+            cell[P7_PZ_SC_I] = ipv * t   + mpv * timv;                  \
+            cell[P7_PZ_SC_D] =             mpv * tdmv;                  \
+            mcv              = ipv * tmi + mpv * tmmv;                  \
+            mpv              = cell[P7_PZ_SC_M] * rp[q];                \
+            cell[P7_PZ_SC_M] = mcv;                                     \
+            tdmv = tv[q*7 + 3];                                         \
+            timv = tv[q*7 + 2];                                         \
+            tmmv = tv[q*7 + 1];                                         \
+            xBv  = xBv + mpv * tv[q*7 + 0];      /* BM */               \
+        }                                                               \
+                                                                        \
+        /* phase 2: the specials.  Order is load-bearing (see comments   \
+         * in fwdback.c): xB, then xJ/xN, then xE. */                   \
+        xB = fwd_hsum(xBv);                                             \
+        xC =  xC * xf_cloop;                                            \
+        xJ = (xB * xf_jmove) + (xJ * xf_jloop);                         \
+        xN = (xB * xf_nmove) + (xN * xf_nloop);                         \
+        xE = (xC * xf_emove) + (xJ * xf_eloop);                         \
+                                                                        \
+        /* phase 3: {MD}->E and one D->D step */                        \
+        { const float4 xEv = (float4){ xE, xE, xE, xE };                \
+          dpv = fwd_lshiftz(rw[P7_PZ_SC_D] + xEv);                      \
+          dcv = zero;                                                   \
+          for (q = Q-1; q >= 0; q--) {                                  \
+              float4* const cell = rw + q * P7_PZ_NSCELLS;              \
+              dcv                = dpv * tdd[q];                        \
+              cell[P7_PZ_SC_D]   = cell[P7_PZ_SC_D] + (dcv + xEv);      \
+              dpv                = cell[P7_PZ_SC_D];                    \
+              cell[P7_PZ_SC_M]   = cell[P7_PZ_SC_M] + xEv;              \
+          }                                                             \
+                                                                        \
+          /* phase 4: three more DD passes, always all three */         \
+          for (j2 = 1; j2 < 4; j2++) {                                  \
+              dcv = fwd_lshiftz(dcv);                                   \
+              for (q = Q-1; q >= 0; q--) {                              \
+                  float4* const d = rw + q*P7_PZ_NSCELLS + P7_PZ_SC_D;  \
+                  dcv = dcv * tdd[q];                                   \
+                  *d  = *d + dcv;                                       \
+              }                                                         \
+              CHG                                                      \
+          }                                                             \
+                                                                        \
+          /* phase 5: M->D paths */                                     \
+          dcv = fwd_lshiftz(rw[P7_PZ_SC_D]);                            \
+          for (q = Q-1; q >= 0; q--) {                                  \
+              float4* const m = rw + q*P7_PZ_NSCELLS + P7_PZ_SC_M;      \
+              *m  = *m + dcv * tv[q*7 + 4];                             \
+              dcv = rw[q*P7_PZ_NSCELLS + P7_PZ_SC_D];                   \
+          } }                                                           \
+                                                                        \
+        /* Sparse rescaling.  In rare cases fwd's factors are not enough \
+         * and Backward would overflow, and the reference then switches   \
+         * to its own factors for the rest of the sequence [J3/119]. */  \
+        if (xB > 1.0e16f) own = 1;                                      \
+        s = own ? ((xB > 1.0e4f) ? xB : 1.0f)                            \
+                : fxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_SCALE];              \
+        bxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_SCALE] = s;                   \
+        if (s > 1.0f) {                                                 \
+            xE = xE / s;  xN = xN / s;  xJ = xJ / s;  xB = xB / s;  xC = xC / s; \
+            { const float  si  = (float) (1.0 / (double) s);            \
+              const float4 inv = (float4){ si, si, si, si };            \
+              for (q = 0; q < 3 * Q; q++) rw[q] = rw[q] * inv; }        \
+        }                                                               \
+                                                                        \
+        bxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_E] = xE;                      \
+        bxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_N] = xN;                      \
+        bxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_J] = xJ;                      \
+        bxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_B] = xB;                      \
+        bxmx[i * P7_PZ_NXCELLS + P7_PZ_XC_C] = xC;                      \
+    }                                                                   \
+                                                                        \
+    /* ---- i = 0: only N and B are reachable.  fwdback.c:715-739 ---- */ \
+    { const float4* rp = rv + (long)sq[1] * Q;                          \
+      float4 xBv = zero;                                                \
+      for (q = 0; q < Q; q++) {                                         \
+          float4 mpv = rw[q*P7_PZ_NSCELLS + P7_PZ_SC_M] * rp[q];        \
+          mpv = mpv * tv[q*7 + 0];                                      \
+          xBv = xBv + mpv;                                              \
+      }                                                                 \
+      xB = fwd_hsum(xBv);                                               \
+      xN = (xB * xf_nmove) + (xN * xf_nloop);                           \
+                                                                        \
+      bxmx[P7_PZ_XC_B]     = xB;                                        \
+      bxmx[P7_PZ_XC_C]     = 0.0f;                                      \
+      bxmx[P7_PZ_XC_J]     = 0.0f;                                      \
+      bxmx[P7_PZ_XC_N]     = xN;                                        \
+      bxmx[P7_PZ_XC_E]     = 0.0f;                                      \
+      bxmx[P7_PZ_XC_SCALE] = 1.0f; }                                    \
+}
+
+/* One item: the shared prologue, then Forward, then Backward. */
+#define FBP_ITEM_BODY(CHG)                                              \
+{                                                                       \
+    FBP_PROLOGUE                                                        \
+    FWDP_ITEM_BODY(CHG)                                                 \
+    BCKP_ITEM_BODY(CHG)                                                 \
+}
+
+/* One item at a time: an item here is an entire Forward pass, and a batch can
+ * hold fewer items than the device has threads, so SSV's GRAB of 4 would leave
+ * three quarters of them idle. */
+#define FWDP_GRAB 1
+
+#define FWDP_BODY(NTHREAD, CHG)                                         \
+{                                                                       \
+    const int Q = P7_PZ_NQF(M);                                         \
+    float* const row = (float*)get_local_mem_addr()                     \
+                     + (long)get_tid() * P7_PZ_FBROW_FLOATS(Q);         \
+                                                                        \
+    pz_atomic_flush();   /* see the host's zeroing of <counter> */          \
+                                                                        \
+    /* Threads past the variant's width leave at once, as ssv_lmem_pe does.  \
+     * The launch is still the full work size, so the completion tally the    \
+     * host checks against the watchdog stays comparable across variants. */  \
+    if (get_tid() >= (NTHREAD)) PZ_QUIT(counter);                       \
+                                                                        \
+    for (;;)                                                            \
+    {                                                                   \
+        int base = pz_atomic_add(counter, FWDP_GRAB);  /* the OLD value */ \
+        int last, j;                                                    \
+        if (base >= nitem) break;                                       \
+        last = base + FWDP_GRAB; if (last > nitem) last = nitem;         \
+        for (j = base; j < last; j++) FBP_ITEM_BODY(CHG)                \
+    }                                                                   \
+                                                                        \
+    PZ_QUIT(counter);                                                   \
+}
+
+/* How many of a PE's eight threads run is a local-memory question: each needs
+ * its own DP row of 48*Q bytes.  The host picks the widest variant that fits
+ * (p7_pz.c pz_fb_tpp()); more threads per PE is what hides the latency of the
+ * tfv/rfv loads, which stay in global memory. */
+void pzc_fbparse_t8(FWDP_ARGS) FWDP_BODY(8, chgthread();)
+void pzc_fbparse_t4(FWDP_ARGS) FWDP_BODY(4, chgthread();)
+void pzc_fbparse_t2(FWDP_ARGS) FWDP_BODY(2, chgthread();)
+void pzc_fbparse_t1(FWDP_ARGS) FWDP_BODY(1,)
+
+/*****************************************************************
+ * 8. Device memory bandwidth probe
+ *
+ * Diagnostic only; nothing in the pipeline calls this.  It exists to decide
+ * whether the O(ML) full-matrix chain of p7_domaindef.c is worth moving to the
+ * device.  That chain makes ~8 passes over a 12-byte-per-cell DP matrix, which
+ * for one hmmsearch query works out to roughly 70 GB of traffic.  The host
+ * gets away with it because one domain's pair of matrices is ~1.3 MB and its
+ * threads' worth fits in the CPU's last-level cache; with a pair per device
+ * thread the working set is several GB, far past the device's caches, so it
+ * goes to device memory.  Whether that is affordable depends entirely on the
+ * achieved copy bandwidth, which is a runtime property of the card -- so
+ * measure it, here, now.
+ *
+ * Three kernels, one number each: pure read (sum), pure write (fill), and
+ * read+write (copy).  The buffer must be much larger than the device's
+ * last-level cache or the cache answers instead of memory; the host passes
+ * 512 MB.
+ *****************************************************************/
+
+/* Sum a buffer.  <out> keeps the compiler from eliminating the loads. */
+void
+pzc_bw_read(const float4 *src, long n4, float *out, int *counter)
+{
+    const long gid = (long) get_pid() * get_maxtid() + get_tid();
+    const long st  = (long) get_maxpid() * get_maxtid();
+    float4     acc = (float4){ 0.0f, 0.0f, 0.0f, 0.0f };
+    long       i;
+
+    pz_atomic_flush();
+    for (i = gid; i < n4; i += st) { acc = acc + src[i]; chgthread(); }
+    if (acc.x + acc.y + acc.z + acc.w == 1.25e-30f) out[gid] = 1.0f;  /* never true */
+    PZ_QUIT(counter);
+}
+
+void
+pzc_bw_write(float4 *dst, long n4, int *counter)
+{
+    const long   gid = (long) get_pid() * get_maxtid() + get_tid();
+    const long   st  = (long) get_maxpid() * get_maxtid();
+    const float4 v   = (float4){ 1.0f, 2.0f, 3.0f, 4.0f };
+    long         i;
+
+    pz_atomic_flush();
+    for (i = gid; i < n4; i += st) { dst[i] = v; chgthread(); }
+    PZ_QUIT(counter);
+}
+
+void
+pzc_bw_copy(const float4 *src, float4 *dst, long n4, int *counter)
+{
+    const long gid = (long) get_pid() * get_maxtid() + get_tid();
+    const long st  = (long) get_maxpid() * get_maxtid();
+    long       i;
+
+    pz_atomic_flush();
+    for (i = gid; i < n4; i += st) { dst[i] = src[i]; chgthread(); }
+    PZ_QUIT(counter);
+}

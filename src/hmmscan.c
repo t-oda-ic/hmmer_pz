@@ -29,7 +29,14 @@
 #include "esl_workqueue.h"
 #endif
 
+#include "esl_gumbel.h"
 #include "hmmer.h"
+#include "p7_hmmcache.h"
+#ifdef HAVE_PEZY
+#include "p7_pz.h"
+#endif
+#include <sys/stat.h>
+#include <pthread.h>
 
 typedef struct {
 #ifdef HMMER_THREADS
@@ -40,6 +47,25 @@ typedef struct {
   P7_PIPELINE      *pli;         /* work pipeline                           */
   P7_TOPHITS       *th;          /* top hit results                         */
 } WORKER_INFO;
+
+typedef struct {
+  float  **rows;      /* [n * Kp] row pointers into <data>  */
+  float   *data;      /* [n * Kp * fM] odds ratios          */
+  int      Kp, fM;
+  uint32_t n;
+} BIAS_CACHE;
+
+/* What cached_loop() needs to know about the device, if it is in use. */
+struct scan_dev_s {
+#ifdef HAVE_PEZY
+  P7_PZMM       *pzmm;
+  const uint8_t *xE;
+  int            nq, qi;
+#else
+  int            unused;
+#endif
+};
+
 
 #define REPOPTS     "-E,-T,--cut_ga,--cut_nc,--cut_tc"
 #define DOMREPOPTS  "--domE,--domT,--cut_ga,--cut_nc,--cut_tc"
@@ -123,6 +149,19 @@ static char banner[] = "search sequence(s) against a profile database";
 
 static int  serial_master(ESL_GETOPTS *go, struct cfg_s *cfg);
 static int  serial_loop  (WORKER_INFO *info, P7_HMMFILE *hfp);
+typedef struct scan_dev_s SCAN_DEV;
+struct scan_pool_s;                              /* the cached path's persistent workers */
+static int  scan_nactive(uint32_t nmodel, int nworker);
+static void scan_pool_destroy(struct scan_pool_s *p);
+static int  cached_loop  (WORKER_INFO *info, int infocnt, const P7_HMMCACHE *cache, const BIAS_CACHE *bias,
+                          SCAN_DEV *dev, int blocksize, struct scan_pool_s **ret_pool);
+static BIAS_CACHE *bias_cache_Create (const P7_HMMCACHE *cache, ESL_ALPHABET *abc);
+static void        bias_cache_Destroy(BIAS_CACHE *bc);
+static int  scan_cache_minq(void);
+static int64_t scan_cache_maxbytes(void);
+static int  scan_count_queries(ESL_SQFILE *sqfp, ESL_ALPHABET *abc, int upto);
+static int64_t scan_cache_estimate(const char *hmmfile);
+static int  scan_qbatch(void);
 
 #ifdef HMMER_THREADS
 #define BLOCK_SIZE 1000
@@ -155,7 +194,7 @@ process_commandline(int argc, char **argv, ESL_GETOPTS **ret_go, char **ret_hmmf
   /* help format: */
   if (esl_opt_GetBoolean(go, "-h") == TRUE) 
     {
-      p7_banner(stdout, argv[0], banner);
+      p7_banner_help(stdout, argv[0], banner);
       esl_usage(stdout, argv[0], usage);
       if (puts("\nBasic options:")                                           < 0) ESL_XEXCEPTION_SYS(eslEWRITE, "write failed");
       esl_opt_DisplayHelp(stdout, go, 1, 2, 80); /* 1= group; 2 = indentation; 80=textwidth*/
@@ -331,7 +370,8 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
   ESL_ALPHABET    *abc      = NULL;              /* sequence alphabet                               */
   P7_OPROFILE     *om       = NULL;		 /* target profile                                  */
   ESL_STOPWATCH   *w        = NULL;              /* timing                                          */
-  ESL_SQ          *qsq      = NULL;		 /* query sequence                                  */
+  ESL_SQ          *qsq      = NULL;		 /* current query (borrowed)                        */
+  ESL_SQ          *qsq_own  = NULL;		 /* the streaming path's own buffer                 */
   int              nquery   = 0;
   int              textw;
   int              status   = eslOK;
@@ -343,6 +383,19 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
 
   int              infocnt  = 0;
   WORKER_INFO     *info     = NULL;
+  int              infoalloc;                    /* info[] entries allocated (>= infocnt) */
+  P7_HMMCACHE     *hcache   = NULL;              /* resident profile database, or NULL */
+  struct scan_pool_s *scanpool = NULL;           /* persistent workers for the cached path */
+  BIAS_CACHE      *bcache   = NULL;              /* per-model bias filter odds ratios  */
+#ifdef HAVE_PEZY
+  P7_PZ           *pz       = NULL;              /* PEZY-SC context, or NULL           */
+  P7_PZMM         *pzmm     = NULL;              /* all models' score tables on device */
+  uint8_t         *pz_xE    = NULL;              /* [nmodel * qb_n] SSV results        */
+  char             pzerr[eslERRBUFSIZE];
+#endif
+  ESL_SQ         **qbuf     = NULL;              /* buffered query batch               */
+  int              qb_n     = 0, qb_i = 0, qb_alloc = 0;
+  char             cerrbuf[eslERRBUFSIZE];
 #ifdef HMMER_THREADS
   P7_OM_BLOCK     *block    = NULL;
   ESL_THREADS     *threadObj= NULL;
@@ -375,6 +428,8 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
 
   p7_oprofile_Destroy(om);
   p7_hmmfile_Close(hfp);
+  hfp = NULL;             /* this probe leaves <hfp> dangling otherwise, and the
+                           * resident-database path passes it to the pipeline */
 
   /* Open the query sequence database */
   status = esl_sqfile_OpenDigital(abc, cfg->seqfile, seqfmt, NULL, &sqfp);
@@ -382,7 +437,7 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
   else if (status == eslEFORMAT)   p7_Fail("Sequence file %s is empty or misformatted\n",        cfg->seqfile);
   else if (status == eslEINVAL)    p7_Fail("Can't autodetect format of a stdin or .gz seqfile");
   else if (status != eslOK)        p7_Fail("Unexpected error %d opening sequence file %s\n", status, cfg->seqfile);
-  qsq = esl_sq_CreateDigital(abc);
+  qsq_own = esl_sq_CreateDigital(abc);
 
   /* Open the results output files */
   if (esl_opt_IsOn(go, "-o"))          { if ((ofp      = fopen(esl_opt_GetString(go, "-o"),          "w")) == NULL)  esl_fatal("Failed to open output file %s for writing\n",                 esl_opt_GetString(go, "-o")); }
@@ -403,6 +458,7 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
 #endif
 
   infocnt = (ncpus == 0) ? 1 : ncpus;
+  infoalloc = infocnt;                 /* infocnt may shrink below; free this many */
   ESL_ALLOC(info, (ptrdiff_t) sizeof(*info) * infocnt);
 
   for (i = 0; i < infocnt; ++i)
@@ -424,24 +480,126 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
     }
 #endif
 
-  /* Outside loop: over each query sequence in <seqfile>. */
-  while ((sstatus = esl_sqio_Read(sqfp, qsq)) == eslOK)
+  /* With more than a handful of queries it is much cheaper to read the profile
+   * database once and scan it from memory than to re-read it per query; see the
+   * comment above cached_loop().  Anything unusual -- a query file we cannot
+   * rewind to count, a database too large to hold -- leaves hcache NULL and the
+   * original per-query loop is used. */
+  {
+    int     minq = scan_cache_minq();
+    int     nq   = (minq > 1) ? scan_count_queries(sqfp, abc, minq) : minq;
+    int64_t est  = scan_cache_estimate(cfg->hmmfile);
+
+    if (nq >= minq && est > 0 && est <= scan_cache_maxbytes())
+      {
+        if (p7_hmmcache_Open(cfg->hmmfile, &hcache, cerrbuf) != eslOK) hcache = NULL;
+        if (hcache) bcache = bias_cache_Create(hcache, abc);   /* NULL is tolerated */
+      }
+  }
+
+  /* On the cached path, use only as many workers as there is work for.  Every
+   * query creates and merges one pipeline and one hit list PER WORKER, and a
+   * pipeline allocates four DP matrices, so an unused worker is not free even
+   * if it never runs -- see scan_nactive() for the measurements.  The reported
+   * worker count is --cpu itself, so the output does not change. */
+  if (hcache != NULL) infocnt = scan_nactive(hcache->n, infocnt);
+
+#ifdef HAVE_PEZY
+  /* With the profile database resident we can also put the SSV filter on the
+   * device: build every model's score tables once, keep them there, and score a
+   * whole batch of queries against all of them in one launch.  Falling back is
+   * always safe -- pzmm NULL just means the host runs the filter. */
+  if (hcache != NULL && p7_pz_DeviceCount() > 0)
     {
+      if ((pz = p7_pz_Create(0, pzerr)) != NULL)
+        {
+          int nth = (ncpus > 0 ? ncpus : 1) + 1;
+          if (p7_pzmm_Create(pz, hcache->list, (int) hcache->n, nth, &pzmm, pzerr) != eslOK) pzmm = NULL;
+          if (pzmm) {
+            qb_alloc = scan_qbatch();
+            ESL_ALLOC(pz_xE, (size_t) hcache->n * qb_alloc);
+          }
+          if (pzmm == NULL) { p7_pz_Destroy(pz); pz = NULL; }
+        }
+    }
+#endif
+  if (hcache != NULL && qb_alloc == 0) qb_alloc = scan_qbatch();
+  if (qb_alloc > 0) ESL_ALLOC(qbuf, sizeof(ESL_SQ *) * qb_alloc);
+
+  /* Outside loop: over each query sequence in <seqfile>.
+   *
+   * When the profile database is resident, queries are taken a batch at a time
+   * so the device can score the whole batch against every model in one launch.
+   * Results are still emitted one query at a time, in input order.
+   */
+  for (;;)
+    {
+      if (qb_alloc > 0)
+        {
+          if (qb_i == qb_n)
+            {
+              int k;
+              for (k = 0; k < qb_n; k++) esl_sq_Destroy(qbuf[k]);
+              qb_n = qb_i = 0;
+              while (qb_n < qb_alloc)
+                {
+                  ESL_SQ *nx = esl_sq_CreateDigital(abc);
+                  if ((sstatus = esl_sqio_Read(sqfp, nx)) != eslOK) { esl_sq_Destroy(nx); break; }
+                  qbuf[qb_n++] = nx;
+                }
+              if (qb_n == 0) break;
+              sstatus = eslOK;
+#ifdef HAVE_PEZY
+              if (pzmm)
+                {
+                  ESL_DSQ *dq[1]; int ll[1];
+                  ESL_DSQ **dqs = NULL; int *lls = NULL;
+                  int k2;
+                  (void) dq; (void) ll;
+                  ESL_ALLOC(dqs, sizeof(ESL_DSQ *) * qb_n);
+                  ESL_ALLOC(lls, sizeof(int)       * qb_n);
+                  for (k2 = 0; k2 < qb_n; k2++) { dqs[k2] = qbuf[k2]->dsq; lls[k2] = (int) qbuf[k2]->n; }
+                  /* A launch that does not come back clean leaves scores we
+                   * must not use: give the device up and let the ordinary CPU
+                   * pipeline finish the run rather than report wrong hits. */
+                  if (p7_pzmm_SSV(pz, pzmm, (const ESL_DSQ **) dqs, lls, qb_n, pz_xE) != eslOK)
+                    {
+                      fprintf(stderr, "\n# WARNING: a PEZY-SC SSV launch did not complete "
+                                      "(see pzcl.log); falling back to the CPU filter for the rest of this run.\n");
+                      p7_pzmm_Destroy(pzmm); pzmm = NULL;
+                      p7_pz_Destroy(pz);     pz   = NULL;
+                    }
+                  free(dqs); free(lls);
+                }
+#endif
+            }
+          qsq = qbuf[qb_i++];
+        }
+      else
+        {
+          esl_sq_Reuse(qsq_own);
+          if ((sstatus = esl_sqio_Read(sqfp, qsq_own)) != eslOK) break;
+          qsq = qsq_own;
+        }
+
       nquery++;
       esl_stopwatch_Start(w);	                          
 
-      /* Open the target profile database */
-      status = p7_hmmfile_Open(cfg->hmmfile, p7_HMMDBENV, &hfp, NULL);
-      if (status != eslOK)        p7_Fail("Unexpected error %d in opening hmm file %s.\n",           status, cfg->hmmfile);  
-  
+      /* Open the target profile database (not needed when it is resident) */
+      if (hcache == NULL)
+        {
+          status = p7_hmmfile_Open(cfg->hmmfile, p7_HMMDBENV, &hfp, NULL);
+          if (status != eslOK)        p7_Fail("Unexpected error %d in opening hmm file %s.\n",           status, cfg->hmmfile);
+
 #ifdef HMMER_THREADS
-      /* if we are threaded, create a lock to prevent multiple readers */
-      if (ncpus > 0)
-	{
-	  status = p7_hmmfile_CreateLock(hfp);
-	  if (status != eslOK) p7_Fail("Unexpected error %d creating lock\n", status);
-	}
+          /* if we are threaded, create a lock to prevent multiple readers */
+          if (ncpus > 0)
+            {
+              status = p7_hmmfile_CreateLock(hfp);
+              if (status != eslOK) p7_Fail("Unexpected error %d creating lock\n", status);
+            }
 #endif
+        }
 
       if (fprintf(ofp, "Query:       %s  [L=%ld]\n", qsq->name, (long) qsq->n) < 0) ESL_EXCEPTION_SYS(eslEWRITE, "write failed");
       if (qsq->acc[0]  != 0 && fprintf(ofp, "Accession:   %s\n", qsq->acc)     < 0) ESL_EXCEPTION_SYS(eslEWRITE, "write failed");
@@ -452,22 +610,40 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
 	  /* Create processing pipeline and hit list */
 	  info[i].th  = p7_tophits_Create(); 
 	  info[i].pli = p7_pipeline_Create(go, 100, 100, FALSE, p7_SCAN_MODELS); /* M_hint = 100, L_hint = 100 are just dummies for now */
-	  info[i].pli->hfp = hfp;  /* for two-stage input, pipeline needs <hfp> */
+	  /* for two-stage input the pipeline needs <hfp>; a resident database is
+	   * already complete, so leaving this NULL skips p7_oprofile_ReadRest() */
+	  info[i].pli->hfp = hfp;
 
 	  p7_pli_NewSeq(info[i].pli, qsq);
 	  info[i].qsq = qsq;
 
 #ifdef HMMER_THREADS
-	  if (ncpus > 0) esl_threads_AddThread(threadObj, &info[i]);
+	  /* esl_threads_AddThread() starts its pipeline_thread immediately and
+	   * that thread blocks on the work queue forever, so the cached path
+	   * must not create them. */
+	  if (ncpus > 0 && hcache == NULL) esl_threads_AddThread(threadObj, &info[i]);
 #endif
 	}
 
-#ifdef HMMER_THREADS
-      if (ncpus > 0)  hstatus = thread_loop(threadObj, queue, hfp);
-      else	      hstatus = serial_loop(info, hfp);
-#else
-      hstatus = serial_loop(info, hfp);
+      {
+        SCAN_DEV devd;
+        SCAN_DEV *devp = NULL;
+        memset(&devd, 0, sizeof(devd));
+#ifdef HAVE_PEZY
+        if (pzmm) { devd.pzmm = pzmm; devd.xE = pz_xE; devd.nq = qb_n; devd.qi = qb_i - 1; devp = &devd; }
 #endif
+        if (hcache != NULL) hstatus = cached_loop(info, infocnt, hcache, bcache, devp, BLOCK_SIZE, &scanpool);
+        else hstatus = eslENORESULT;
+      }
+      if (hcache == NULL)
+        {
+#ifdef HMMER_THREADS
+          if (ncpus > 0) hstatus = thread_loop(threadObj, queue, hfp);
+          else	         hstatus = serial_loop(info, hfp);
+#else
+          hstatus = serial_loop(info, hfp);
+#endif
+        }
       switch(hstatus)
 	{
 	case eslEFORMAT:   p7_Fail("bad file format in HMM file %s",             cfg->hmmfile);	  break;
@@ -502,15 +678,24 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
       if (fprintf(ofp, "//\n") < 0) ESL_EXCEPTION_SYS(eslEWRITE, "write failed");
       fflush(ofp);
 
-      p7_hmmfile_Close(hfp);
+      if (hcache == NULL) { p7_hmmfile_Close(hfp); hfp = NULL; }
       p7_pipeline_Destroy(info->pli);
       p7_tophits_Destroy(info->th);
-      esl_sq_Reuse(qsq);
     }
   if      (sstatus == eslEFORMAT) esl_fatal("Parse failed (sequence file %s):\n%s\n",
 					    sqfp->filename, esl_sqfile_GetErrorBuf(sqfp));
   else if (sstatus != eslEOF)     esl_fatal("Unexpected error %d reading sequence file %s",
 					    sstatus, sqfp->filename);
+
+#ifdef HAVE_PEZY
+  if (pz_xE) free(pz_xE);
+  if (pzmm)  p7_pzmm_Destroy(pzmm);
+  if (pz)    p7_pz_Destroy(pz);
+#endif
+  if (qbuf) { int k; for (k = 0; k < qb_n; k++) esl_sq_Destroy(qbuf[k]); free(qbuf); }
+  if (bcache) bias_cache_Destroy(bcache);
+  if (scanpool) scan_pool_destroy(scanpool);
+  if (hcache) p7_hmmcache_Close(hcache);
 
   /* Terminate outputs - any last words?
    */
@@ -521,7 +706,7 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
 
   /* Cleanup - prepare for successful exit
    */
-  for (i = 0; i < infocnt; ++i)
+  for (i = 0; i < infoalloc; ++i)
     p7_bg_Destroy(info[i].bg);
 
 #ifdef HMMER_THREADS
@@ -537,7 +722,7 @@ serial_master(ESL_GETOPTS *go, struct cfg_s *cfg)
 
   free(info);
 
-  esl_sq_Destroy(qsq);
+  if (qsq_own) esl_sq_Destroy(qsq_own);
   esl_stopwatch_Destroy(w);
   esl_alphabet_Destroy(abc);
   esl_sqfile_Close(sqfp);
@@ -731,7 +916,8 @@ mpi_master(ESL_GETOPTS *go, struct cfg_s *cfg)
   ESL_ALPHABET    *abc      = NULL;              /* sequence alphabet                               */
   P7_OPROFILE     *om       = NULL;		 /* target profile                                  */
   ESL_STOPWATCH   *w        = NULL;              /* timing                                          */
-  ESL_SQ          *qsq      = NULL;		 /* query sequence                                  */
+  ESL_SQ          *qsq      = NULL;		 /* current query (borrowed)                        */
+  ESL_SQ          *qsq_own  = NULL;		 /* the streaming path's own buffer                 */
   int              nquery   = 0;
   int              textw;
   int              status   = eslOK;
@@ -977,7 +1163,7 @@ mpi_master(ESL_GETOPTS *go, struct cfg_s *cfg)
   if (mpi_buf != NULL) free(mpi_buf);
 
   p7_bg_Destroy(bg);
-  esl_sq_Destroy(qsq);
+  if (qsq_own) esl_sq_Destroy(qsq_own);
   esl_stopwatch_Destroy(w);
   esl_alphabet_Destroy(abc);
   esl_sqfile_Close(sqfp);
@@ -1004,7 +1190,8 @@ mpi_worker(ESL_GETOPTS *go, struct cfg_s *cfg)
   ESL_ALPHABET    *abc      = NULL;              /* sequence alphabet                               */
   P7_OPROFILE     *om       = NULL;		 /* target profile                                  */
   ESL_STOPWATCH   *w        = NULL;              /* timing                                          */
-  ESL_SQ          *qsq      = NULL;		 /* query sequence                                  */
+  ESL_SQ          *qsq      = NULL;		 /* current query (borrowed)                        */
+  ESL_SQ          *qsq_own  = NULL;		 /* the streaming path's own buffer                 */
   int              status   = eslOK;
   int              hstatus  = eslOK;
   int              sstatus  = eslOK;
@@ -1147,7 +1334,7 @@ mpi_worker(ESL_GETOPTS *go, struct cfg_s *cfg)
 
   p7_bg_Destroy(bg);
 
-  esl_sq_Destroy(qsq);
+  if (qsq_own) esl_sq_Destroy(qsq_own);
   esl_stopwatch_Destroy(w);
   esl_alphabet_Destroy(abc);
   esl_sqfile_Close(sqfp);
@@ -1155,6 +1342,490 @@ mpi_worker(ESL_GETOPTS *go, struct cfg_s *cfg)
   return eslOK;
 }
 #endif /*HMMER_MPI*/
+
+/*****************************************************************
+ * Scanning a resident model database
+ *
+ * hmmscan re-opens and re-reads the whole pressed profile database inside its
+ * per-query loop.  With a multi-sequence query that is by far the dominant
+ * cost: on Pfam-A (30,134 models, 531 MB of .h3f) one pass costs ~0.15 s, so a
+ * 50-sequence query spends ~7.5 s of its ~9.4 s just re-reading models.
+ *
+ * Reading the database once into a P7_HMMCACHE and scanning that instead
+ * removes all of it.  This is the same thing hmmpgmd's workers do (see
+ * hmmdwrkr.c), so the pipeline is already built to score against cached
+ * profiles: with pli->hfp left NULL it skips p7_oprofile_ReadRest(), because
+ * the cached profiles are already complete.
+ *
+ * Model blocks are handed to workers round robin by block index.  That matters
+ * for more than load: p7_pli_TargetReportable() tests against pli->Z, which
+ * mid-scan is the worker's own running model count, so which marginal hits get
+ * stored depends on how models were spread over threads.  Using HMMER's own
+ * block size and a fixed round robin reproduces what its work queue does when
+ * the workers keep up with each other.
+ *****************************************************************/
+
+/* The bias filter's two-state HMM depends only on the model (its length and
+ * mean composition), yet p7_bg_SetFilter() rebuilds it for every
+ * (model, query) pair.  esl_hmm_Configure() -- which derives the emission odds
+ * ratios, including averaging over every degenerate residue code -- was 21% of
+ * the whole run once the profile database was resident.
+ *
+ * So derive the odds ratios once per model and let the workers borrow them.
+ * Only <eo> is cached: esl_hmm_Configure() writes nothing else, and the rest of
+ * the filter HMM is either model-independent or two floats derived from M.
+ * Each worker keeps its own t[] and pi[], so nothing shared is ever written.
+ */
+static void
+bias_cache_Destroy(BIAS_CACHE *bc)
+{
+  if (!bc) return;
+  if (bc->rows) free(bc->rows);
+  if (bc->data) free(bc->data);
+  free(bc);
+}
+
+static BIAS_CACHE *
+bias_cache_Create(const P7_HMMCACHE *cache, ESL_ALPHABET *abc)
+{
+  BIAS_CACHE *bc = NULL;
+  P7_BG      *bg = NULL;
+  uint32_t    m;
+  int         x, Kp = abc->Kp, fM;
+  int         status;
+
+  if ((bg = p7_bg_Create(abc)) == NULL) return NULL;
+  fM = bg->fhmm->M;
+
+  ESL_ALLOC(bc, sizeof(BIAS_CACHE));
+  bc->rows = NULL; bc->data = NULL; bc->n = cache->n; bc->Kp = Kp; bc->fM = fM;
+  ESL_ALLOC(bc->rows, sizeof(float *) * (size_t) cache->n * Kp);
+  ESL_ALLOC(bc->data, sizeof(float)   * (size_t) cache->n * Kp * fM);
+
+  for (m = 0; m < cache->n; m++)
+    {
+      /* built by the same code that the unaccelerated path uses, so the values
+       * are identical by construction */
+      p7_bg_SetFilter(bg, cache->list[m]->M, cache->list[m]->compo);
+      for (x = 0; x < Kp; x++)
+        {
+          float *dst = bc->data + ((size_t) m * Kp + x) * fM;
+          int    k;
+          for (k = 0; k < fM; k++) dst[k] = bg->fhmm->eo[x][k];
+          bc->rows[(size_t) m * Kp + x] = dst;
+        }
+    }
+  p7_bg_Destroy(bg);
+  return bc;
+
+ ERROR:
+  if (bg) p7_bg_Destroy(bg);
+  bias_cache_Destroy(bc);
+  return NULL;
+}
+
+typedef struct {
+  WORKER_INFO       *info;
+  const P7_HMMCACHE *cache;
+  const BIAS_CACHE  *bias;      /* may be NULL */
+#ifdef HAVE_PEZY
+  P7_PZMM           *pzmm;      /* NULL when the device is not in use */
+  const uint8_t     *xE;        /* [nmodel * nq] raw-byte SSV scores   */
+  int                nq, qi;    /* batch width, and this query's slot  */
+#endif
+  int                widx, nworker;
+  uint32_t           chunk;     /* models handed out per grab                */
+  uint32_t          *next;      /* shared cursor, bumped atomically          */
+  int                status;
+  struct scan_pool_s *pool;     /* NULL when run directly (infocnt == 1) */
+} SCAN_WORKER;
+
+/* How many of the requested workers to actually run.
+ *
+ * hmmscan runs one query at a time, so a worker's whole share of a query is
+ * cache->n / nworker models -- with Pfam-A and --cpu 128 that is 235 models,
+ * about 0.5 ms of work, against 0.05-0.1 ms to wake it and put it back to
+ * sleep.  MEASURED over 1000 queries against Pfam-A (wall / sys):
+ *
+ *   --cpu        16        32       128
+ *   spawn/query  9.24/2.8  9.08/4.8  12.82/10.9
+ *   pool         8.51/2.8  8.42/5.3   9.84/17.1
+ *   pool+chunk   7.30/3.2  7.25/8.2  10.07/39.0
+ *
+ * More threads is worse past about 32, and it is all kernel time.  So cap the
+ * number that run by the work available.  The output is invariant to the worker
+ * count anyway (measured: --cpu 8 / 32 / 128 differ only in the header line
+ * that reports it, and that line prints --cpu itself, not this).
+ *
+ * The cap is applied to <infocnt> in main() as well, not just to the pool,
+ * because every query creates and merges one pipeline and one hit list PER
+ * WORKER and a pipeline allocates four DP matrices -- with the cap on the pool
+ * alone, --cpu 128 stalled at 8.09 s against 7.25 s for a plain --cpu 32.
+ * With both, --cpu 128 lands at 7.23 s.  MEASURED at --cpu 128, 1000 queries:
+ *
+ *   models/worker   256     512    1024    2048
+ *   workers         117      58      29      14
+ *   wall           9.87    7.62    7.23    7.57
+ *
+ * HMMER_HMMCACHE_MINMODELS overrides the divisor.
+ */
+#define SCAN_MIN_MODELS_PER_WORKER 1024
+static int
+scan_nactive(uint32_t nmodel, int nworker)
+{
+  int n;
+  const char *v = getenv("HMMER_HMMCACHE_MINMODELS");
+  int  minm = SCAN_MIN_MODELS_PER_WORKER;
+
+  if (v) { int k = atoi(v); if (k > 0) minm = k; }
+  n = (int) (nmodel / (uint32_t) minm);
+  if (n < 1)        n = 1;
+  if (n > nworker)  n = nworker;
+  return n;
+}
+
+/* Models handed to a worker per atomic grab.
+ *
+ * cached_loop() used to hand out HMMER's 1000-model blocks by a static stride.
+ * With Pfam-A (30,134 models) that is only 31 blocks, so with --cpu 128
+ * exactly 31 workers got work and 97 woke up, found none, and went back to
+ * sleep.  That did not show up while every query was also paying for 128
+ * thread spawns; once the pool removed those, it did.
+ *
+ * Per (model, query) pair the work is ~2 us, so a chunk of a few tens gives
+ * plenty of work per atomic while leaving many chunks per worker to average
+ * out the ~2% of models that pass F1 and cost orders of magnitude more.
+ */
+static uint32_t
+scan_chunk(uint32_t nmodel, int nworker)
+{
+  uint32_t n;
+  const char *v = getenv("HMMER_HMMCACHE_CHUNK");
+  if (v) { int k = atoi(v); if (k > 0) return (uint32_t) k; }
+
+  n = nmodel / ((uint32_t) nworker * 64u);
+  if (n <  8u) n =  8u;
+  if (n > 64u) n = 64u;
+  return n;
+}
+
+static void
+scan_worker_setup(SCAN_WORKER *sw)
+{
+  ESL_HMM *fh = sw->info->bg->fhmm;
+
+  /* impl_Init() turns on SSE flush-to-zero, which changes float results for
+   * denormals, so every thread that scores must set it. */
+  impl_Init();
+
+  if (sw->bias)
+    {
+      /* the parts of the filter HMM that no model changes.  p7_bg_SetLength()
+       * overwrites t[0][0..1] per query, so we need not set them here. */
+      fh->t[0][2] = 1.0f;
+      fh->t[1][2] = 1.0f;
+      fh->pi[0]   = 0.999;
+      fh->pi[1]   = 0.001;
+    }
+}
+
+/* One query's share of the resident database. */
+static void
+scan_worker_query(SCAN_WORKER *sw)
+{
+  WORKER_INFO       *info  = sw->info;
+  const P7_HMMCACHE *cache = sw->cache;
+  const BIAS_CACHE  *bias  = sw->bias;
+  ESL_HMM           *fh    = info->bg->fhmm;
+  float            **own_eo = fh->eo;
+
+  sw->status = eslOK;
+
+  for (;;)
+    {
+      uint32_t blk = (uint32_t) __sync_fetch_and_add(sw->next, 1u);
+      uint32_t lo  = blk * sw->chunk;
+      uint32_t hi, m;
+
+      if (lo >= cache->n) break;
+      hi = lo + sw->chunk;  if (hi > cache->n) hi = cache->n;
+
+      for (m = lo; m < hi; m++)
+        {
+          P7_OPROFILE *om = cache->list[m];
+
+          if (bias)
+            {
+              float L1 = (float) om->M / 8.0f;     /* mean length of the biased segment */
+              fh->t[1][0] = 1.0f / (L1 + 1.0f);
+              fh->t[1][1] =   L1 / (L1 + 1.0f);
+              fh->eo      = bias->rows + (size_t) m * bias->Kp;   /* borrowed */
+              p7_pli_NewModelNoBias(info->pli, om, info->bg);
+            }
+          else p7_pli_NewModel(info->pli, om, info->bg);
+
+          p7_bg_SetLength(info->bg, info->qsq->n);
+          p7_oprofile_ReconfigLength(om, info->qsq->n);
+
+#ifdef HAVE_PEZY
+          /* The device already scored every (model, query) pair.  Everything the
+           * pipeline does before the MSV filter follows from the query length
+           * alone, so we can reproduce its F1 test here and enter the pipeline
+           * just past the filter. */
+          if (sw->pzmm && p7_pzmm_ModelOnDevice(sw->pzmm, (int) m) && info->qsq->n > 0)
+            {
+              float  usc, nullsc, seq_score;
+              double P;
+
+              p7_omx_GrowTo(info->pli->oxf, om->M, 0, info->qsq->n);
+              p7_bg_NullOne(info->bg, info->qsq->dsq, info->qsq->n, &nullsc);
+
+              if (p7_pz_SSVOutcome(sw->xE[(size_t) m * sw->nq + sw->qi], om, &usc) == eslENORESULT)
+                p7_MSVFilter(info->qsq->dsq, info->qsq->n, om, info->pli->oxf, &usc);  /* SSV could not decide */
+
+              seq_score = (usc - nullsc) / eslCONST_LOG2;
+              P = esl_gumbel_surv(seq_score, om->evparam[p7_MMU], om->evparam[p7_MLAMBDA]);
+              if (P <= info->pli->F1 &&
+                  (sw->status = p7_Pipeline_MSVDone(info->pli, om, info->bg, info->qsq, NULL, info->th, usc)) != eslOK)
+                { fh->eo = own_eo; return; }
+            }
+          else
+#endif
+          if ((sw->status = p7_Pipeline(info->pli, om, info->bg, info->qsq, NULL, info->th)) != eslOK)
+            { fh->eo = own_eo; return; }
+
+          p7_pipeline_Reuse(info->pli);
+          /* the profiles belong to the cache: do not destroy them */
+        }
+    }
+  fh->eo = own_eo;     /* give <bg> its own table back before anyone frees it */
+}
+
+/* A persistent pool for the cached (resident-database) path.
+ *
+ * cached_loop() used to spawn <infocnt> threads and join them for EVERY query,
+ * and hmmscan runs one query at a time: with Pfam-A and --cpu 128 that is
+ * 128 spawns per query, 563,000 over the E. coli proteome.  MEASURED over 1000
+ * queries against Pfam-A: --cpu 128 took wall 12.82 s of which 10.90 s was
+ * system time, while --cpu 32 took 9.08 s with 4.78 s -- asking for MORE
+ * threads made it slower, and the difference was almost all kernel time.
+ *
+ * So create the threads once and park them on a condition variable.  Each
+ * query bumps a generation counter and broadcasts; the last worker out signals
+ * the master.  Everything that varies per query (the pipeline, the hit list,
+ * the query sequence, the device's batch slot) is reached through the
+ * WORKER_INFO pointer or refreshed in the SCAN_WORKER before the broadcast.
+ */
+struct scan_pool_s {
+  SCAN_WORKER    *sw;
+  pthread_t      *tid;
+  int             nworker;
+  pthread_mutex_t mtx;
+  pthread_cond_t  go;         /* master -> workers: a new generation is ready */
+  pthread_cond_t  done;       /* last worker -> master                        */
+  int             gen;        /* bumped once per query                        */
+  int             nrunning;
+  int             shutdown;
+  uint32_t        next;       /* the models cursor, reset before each query   */
+};
+typedef struct scan_pool_s SCAN_POOL;
+
+static void *
+scan_pool_worker(void *arg)
+{
+  SCAN_WORKER *sw    = (SCAN_WORKER *) arg;
+  SCAN_POOL   *p     = sw->pool;
+  int          mygen = 0;
+
+  scan_worker_setup(sw);
+  for (;;)
+    {
+      pthread_mutex_lock(&p->mtx);
+      while (p->gen == mygen && ! p->shutdown) pthread_cond_wait(&p->go, &p->mtx);
+      if (p->shutdown) { pthread_mutex_unlock(&p->mtx); break; }
+      mygen = p->gen;
+      pthread_mutex_unlock(&p->mtx);
+
+      scan_worker_query(sw);
+
+      pthread_mutex_lock(&p->mtx);
+      if (--p->nrunning == 0) pthread_cond_signal(&p->done);
+      pthread_mutex_unlock(&p->mtx);
+    }
+  return NULL;
+}
+
+static void
+scan_pool_destroy(SCAN_POOL *p)
+{
+  int i;
+  if (p == NULL) return;
+  /* With one worker, cached_loop() runs it inline: there are no threads to
+   * join, and the mutex and condition variables were never initialized.  The
+   * zeroed mutex happens to behave like PTHREAD_MUTEX_INITIALIZER, so the
+   * lock and the broadcast came back fine and it was p->tid[0] -- NULL --
+   * that segfaulted.  Skip the whole teardown, not just the join. */
+  if (p->tid)
+    {
+      pthread_mutex_lock(&p->mtx);
+      p->shutdown = TRUE;
+      pthread_cond_broadcast(&p->go);
+      pthread_mutex_unlock(&p->mtx);
+      for (i = 0; i < p->nworker; i++) pthread_join(p->tid[i], NULL);
+      pthread_cond_destroy(&p->done);
+      pthread_cond_destroy(&p->go);
+      pthread_mutex_destroy(&p->mtx);
+      free(p->tid);
+    }
+  free(p->sw);
+  free(p);
+}
+
+static int
+cached_loop(WORKER_INFO *info, int infocnt, const P7_HMMCACHE *cache, const BIAS_CACHE *bias,
+            SCAN_DEV *dev, int blocksize, SCAN_POOL **ret_pool)
+{
+  (void) blocksize;            /* HMMER's block size is not what we schedule by */
+  SCAN_POOL   *p  = *ret_pool;
+  SCAN_WORKER *sw = NULL;
+  int          i;
+  int          status;
+
+  /* First call: build the pool (or, for one worker, just a SCAN_WORKER). */
+  if (p == NULL)
+    {
+      ESL_ALLOC(p, sizeof(SCAN_POOL));
+      memset(p, 0, sizeof(SCAN_POOL));
+      p->nworker = scan_nactive(cache->n, infocnt);
+      ESL_ALLOC(p->sw, sizeof(SCAN_WORKER) * p->nworker);
+      memset(p->sw, 0, sizeof(SCAN_WORKER) * p->nworker);
+      for (i = 0; i < p->nworker; i++)
+        {
+          p->sw[i].info      = &info[i];
+          p->sw[i].cache     = cache;
+          p->sw[i].bias      = bias;
+          p->sw[i].widx      = i;
+          p->sw[i].nworker   = p->nworker;
+          p->sw[i].chunk     = scan_chunk(cache->n, p->nworker);
+          p->sw[i].next      = &p->next;
+          p->sw[i].pool      = p;
+        }
+      if (p->nworker > 1)
+        {
+          pthread_mutex_init(&p->mtx, NULL);
+          pthread_cond_init(&p->go, NULL);
+          pthread_cond_init(&p->done, NULL);
+          ESL_ALLOC(p->tid, sizeof(pthread_t) * p->nworker);
+          for (i = 0; i < p->nworker; i++)
+            if (pthread_create(&p->tid[i], NULL, scan_pool_worker, &p->sw[i]) != 0)
+              { status = eslESYS; goto ERROR; }
+        }
+      else scan_worker_setup(&p->sw[0]);
+      *ret_pool = p;
+    }
+  sw = p->sw;
+
+  /* Refresh what changes per query.  info[] itself does not move, and the
+   * pipeline / hit list / query sequence are reached through it. */
+  for (i = 0; i < p->nworker; i++)
+    {
+#ifdef HAVE_PEZY
+      sw[i].pzmm = dev ? dev->pzmm : NULL;
+      sw[i].xE   = dev ? dev->xE   : NULL;
+      sw[i].nq   = dev ? dev->nq   : 0;
+      sw[i].qi   = dev ? dev->qi   : 0;
+#endif
+      sw[i].status = eslOK;
+    }
+  p->next = 0;                 /* every query starts the cursor over */
+
+  if (p->nworker == 1) scan_worker_query(&sw[0]);
+  else
+    {
+      pthread_mutex_lock(&p->mtx);
+      p->nrunning = p->nworker;
+      p->gen++;
+      pthread_cond_broadcast(&p->go);
+      while (p->nrunning > 0) pthread_cond_wait(&p->done, &p->mtx);
+      pthread_mutex_unlock(&p->mtx);
+    }
+
+  status = eslOK;
+  for (i = 0; i < p->nworker; i++) if (sw[i].status != eslOK) status = sw[i].status;
+  return (status == eslOK) ? eslEOF : status;   /* the callers treat eslEOF as a clean finish */
+
+ ERROR:
+  if (p) { free(p->tid); free(p->sw); free(p); }
+  *ret_pool = NULL;
+  return status;
+}
+
+/* Queries per device batch.  The device scores every (model, query) pair in one
+ * launch, so a batch amortizes the launch and the per-call uploads; the cap
+ * keeps the result array (nmodel x batch bytes) bounded. */
+static int
+scan_qbatch(void)
+{
+  const char *v = getenv("HMMER_HMMCACHE_QBATCH");
+  if (v) { int n = atoi(v); if (n > 0) return n; }
+  return 512;
+}
+
+/* How many queries make the one-off cache load worth it, and how big a
+ * database we are willing to hold. */
+static int
+scan_cache_minq(void)
+{
+  const char *v = getenv("HMMER_HMMCACHE_MINQ");
+  if (v) return atoi(v);
+  return 4;
+}
+static int64_t
+scan_cache_maxbytes(void)
+{
+  const char *v = getenv("HMMER_HMMCACHE_MAX");
+  if (v) { long long n = atoll(v); if (n > 0) return (int64_t) n; }
+  return (int64_t) 64 * 1024 * 1024 * 1024;
+}
+
+/* Count query sequences, cheaply, and leave <sqfp> rewound.  Stops counting at
+ * <upto> since that is all the decision needs.  Returns -1 if the file cannot
+ * be rewound, in which case we must not touch it. */
+static int
+scan_count_queries(ESL_SQFILE *sqfp, ESL_ALPHABET *abc, int upto)
+{
+  ESL_SQ *tmp = NULL;
+  int     n   = 0;
+
+  if (! esl_sqfile_IsRewindable(sqfp)) return -1;
+  if ((tmp = esl_sq_CreateDigital(abc)) == NULL) return -1;
+  while (n < upto && esl_sqio_ReadInfo(sqfp, tmp) == eslOK) { n++; esl_sq_Reuse(tmp); }
+  esl_sq_Destroy(tmp);
+  if (esl_sqfile_Position(sqfp, 0) != eslOK) return -1;
+  return n;
+}
+
+/* Estimated resident size of the cache: the pressed files are within a few
+ * percent of the in-memory profiles they deserialize into. */
+static int64_t
+scan_cache_estimate(const char *hmmfile)
+{
+  struct stat st;
+  char   *path = NULL;
+  int64_t tot  = 0;
+  const char *sfx[2] = { ".h3f", ".h3p" };
+  int     i;
+
+  for (i = 0; i < 2; i++)
+    {
+      if (esl_sprintf(&path, "%s%s", hmmfile, sfx[i]) != eslOK) return -1;
+      if (stat(path, &st) != 0) { free(path); return -1; }
+      tot += (int64_t) st.st_size;
+      free(path); path = NULL;
+    }
+  return tot;
+}
+
 
 static int
 serial_loop(WORKER_INFO *info, P7_HMMFILE *hfp)

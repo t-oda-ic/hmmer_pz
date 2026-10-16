@@ -77,7 +77,7 @@ m4_include([easel/m4/esl_pic_flags.m4])
 # 2. AC_INIT
 ################################################################
 
-AC_INIT([HMMER],[3.4],[sean@eddylab.org],[hmmer])
+AC_INIT([HMMER],[3.4],[https://github.com/t-oda-ic/hmmer_pz/issues],[hmmer])
 AC_MSG_NOTICE([Configuring HMMER3 for your system.])
 
 # remember if the user is overriding CFLAGS
@@ -93,7 +93,7 @@ fi
 # AC_INIT args set these output variables and preprocessor symbols:
 #     PACKAGE_NAME      <package>     e.g. "HMMER"
 #     PACKAGE_VERSION   <version>     e.g. "3.2"
-#     PACKAGE_BUGREPORT <bug-report>  e.g. "sean@eddylab.org"
+#     PACKAGE_BUGREPORT <bug-report>  e.g. "https://github.com/t-oda-ic/hmmer_pz/issues"
 #     PACKAGE_TARNAME   <tarname>     e.g. "hmmer"
 # From them, AC_INIT automatically derives one more:
 #     PACKAGE_STRING    <package> <version>, e.g. "HMMER 3.2"
@@ -102,6 +102,7 @@ fi
 #     HMMER_COPYRIGHT   one-line copyright string
 #     HMMER_LICENSE     one-line license string
 #     HMMER_VERSION     copy of version code, e.g. "3.2"
+#     HMMER_BUGREPORT   contact address(es) for bug reports
 #     HMMER_URL         URL home for HMMER.
 # And we have to define the relevant package variables for Easel as well.
 #
@@ -114,6 +115,7 @@ HMMER_COPYRIGHT="Copyright (C) 2023 Howard Hughes Medical Institute."
 HMMER_LICENSE="Freely distributed under the BSD open source license."
 HMMER_VERSION=$PACKAGE_VERSION
 HMMER_URL="http://hmmer.org/"
+HMMER_BUGREPORT=$PACKAGE_BUGREPORT
 
 HMMER_ESLDIR="easel"
 HMMER_SADIR="libdivsufsort"
@@ -129,6 +131,7 @@ AC_SUBST(HMMER_COPYRIGHT)
 AC_SUBST(HMMER_LICENSE)
 AC_SUBST(HMMER_VERSION)
 AC_SUBST(HMMER_URL)
+AC_SUBST(HMMER_BUGREPORT)
 
 AC_SUBST(HMMER_ESLDIR)
 AC_SUBST(HMMER_SADIR)
@@ -144,6 +147,7 @@ AC_DEFINE_UNQUOTED([HMMER_COPYRIGHT], ["$HMMER_COPYRIGHT"], [Brief copyright sta
 AC_DEFINE_UNQUOTED([HMMER_LICENSE],   ["$HMMER_LICENSE"],   [Brief license statement])
 AC_DEFINE_UNQUOTED([HMMER_VERSION],   ["$HMMER_VERSION"],   [Version number])
 AC_DEFINE_UNQUOTED([HMMER_URL],       ["$HMMER_URL"],       [HMMER web site])
+AC_DEFINE_UNQUOTED([HMMER_BUGREPORT], ["$HMMER_BUGREPORT"], [Contact address(es) for bug reports])
 
 AC_DEFINE_UNQUOTED([EASEL_DATE],      ["$EASEL_DATE"],      [Easel release date])
 AC_DEFINE_UNQUOTED([EASEL_COPYRIGHT], ["$EASEL_COPYRIGHT"], [Easel copyright])
